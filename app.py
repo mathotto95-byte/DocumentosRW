@@ -24,9 +24,11 @@ TIPOS_DOCUMENTO = [
     "CIV",
     "CIPP",
     "AFERIÇÃO",
+    "AGENDAMENTO AFERIÇÃO",
     "CRONOTACÓGRAFO",
     "IBAMA",
     "CR IBAMA",
+    "AETs",
     "CRLV",
 ]
 
@@ -102,12 +104,16 @@ def classificar_documento(valor) -> str | None:
         return "CR IBAMA"
     if "CRLV" in texto:
         return "CRLV"
+    if re.search(r"(^|\W)AETS?($|\W)", texto):
+        return "AETs"
     if "IBAMA" in texto:
         return "IBAMA"
     if "CIPP" in texto:
         return "CIPP"
     if re.search(r"(^|\W)CIV($|\W)", texto):
         return "CIV"
+    if "AGEND" in texto and ("AFERICAO" in texto or "AFER" in texto):
+        return "AGENDAMENTO AFERIÇÃO"
     if "AFERICAO" in texto or texto.startswith("AFER"):
         return "AFERIÇÃO"
     if "CRONOT" in texto:
@@ -161,6 +167,18 @@ def data_iso(valor) -> str | None:
 def formatar_data(valor) -> str:
     convertido = converter_data(valor)
     return "" if pd.isna(convertido) else convertido.strftime("%d/%m/%Y")
+
+
+def formatar_data_hora(valor) -> str:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return ""
+    try:
+        convertido = datetime.fromisoformat(str(valor))
+    except (TypeError, ValueError):
+        convertido = pd.to_datetime(valor, errors="coerce")
+        if pd.isna(convertido):
+            return ""
+    return convertido.strftime("%d/%m/%Y %H:%M:%S")
 
 
 def criar_nomes_unicos(colunas) -> list[str]:
@@ -239,6 +257,21 @@ def inicializar_banco() -> None:
                 substituido_na_importacao_id INTEGER
             );
 
+            CREATE TABLE IF NOT EXISTS historico_atualizacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_hora TEXT NOT NULL,
+                usuario TEXT NOT NULL,
+                documento TEXT NOT NULL,
+                placa TEXT,
+                composicao TEXT,
+                vencimento_anterior TEXT,
+                novo_vencimento TEXT NOT NULL,
+                origem TEXT,
+                acao TEXT NOT NULL,
+                importacao_id INTEGER,
+                FOREIGN KEY (importacao_id) REFERENCES importacoes(id)
+            );
+
             CREATE TABLE IF NOT EXISTS backup_documentos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 importacao_id INTEGER NOT NULL,
@@ -263,10 +296,51 @@ def inicializar_banco() -> None:
                 ON documentos(vencimento);
             CREATE INDEX IF NOT EXISTS idx_historico_placa_documento
                 ON historico_documentos(placa, documento);
+            CREATE INDEX IF NOT EXISTS idx_atualizacoes_data
+                ON historico_atualizacoes(data_hora DESC);
             CREATE INDEX IF NOT EXISTS idx_backup_importacao
                 ON backup_documentos(importacao_id);
             """
         )
+        if conn.execute("SELECT COUNT(*) FROM historico_atualizacoes").fetchone()[0] == 0:
+            # Migração transparente para bancos criados por versões anteriores.
+            conn.execute(
+                """
+                INSERT INTO historico_atualizacoes (
+                    data_hora, usuario, documento, placa, composicao,
+                    vencimento_anterior, novo_vencimento, origem, acao,
+                    importacao_id
+                )
+                SELECT h.substituido_em, h.substituido_por, h.documento, h.placa,
+                       h.composicao, h.vencimento,
+                       COALESCE(d.vencimento, h.vencimento),
+                       COALESCE(d.origem, h.origem), 'ALTERAÇÃO',
+                       h.substituido_na_importacao_id
+                FROM historico_documentos h
+                LEFT JOIN documentos d
+                  ON d.placa = h.placa AND d.documento = h.documento
+                ORDER BY h.id
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO historico_atualizacoes (
+                    data_hora, usuario, documento, placa, composicao,
+                    vencimento_anterior, novo_vencimento, origem, acao,
+                    importacao_id
+                )
+                SELECT d.importado_em, d.importado_por, d.documento, d.placa,
+                       d.composicao, NULL, d.vencimento, d.origem, 'IMPORTAÇÃO',
+                       d.importacao_id
+                FROM documentos d
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM historico_atualizacoes a
+                    WHERE a.documento = d.documento
+                      AND a.placa = d.placa
+                      AND a.importacao_id = d.importacao_id
+                )
+                """
+            )
 
 
 def salvar_importacao(
@@ -341,6 +415,20 @@ def salvar_importacao(
                         usuario, importacao_id,
                     ),
                 )
+                conn.execute(
+                    """
+                    INSERT INTO historico_atualizacoes (
+                        data_hora, usuario, documento, placa, composicao,
+                        vencimento_anterior, novo_vencimento, origem, acao,
+                        importacao_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        momento, usuario, registro["documento"], registro["placa"],
+                        registro["composicao"], None, registro["vencimento"],
+                        registro["origem"], "INSERÇÃO", importacao_id,
+                    ),
+                )
                 estatisticas["inseridos"] += 1
                 continue
 
@@ -381,6 +469,21 @@ def salvar_importacao(
                     registro["placa_carreta_2"], registro["equipamento"],
                     registro["origem"], momento, usuario, importacao_id,
                     existente["id"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO historico_atualizacoes (
+                    data_hora, usuario, documento, placa, composicao,
+                    vencimento_anterior, novo_vencimento, origem, acao,
+                    importacao_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    momento, usuario, registro["documento"], registro["placa"],
+                    registro["composicao"], existente["vencimento"],
+                    registro["vencimento"], registro["origem"], "ALTERAÇÃO",
+                    importacao_id,
                 ),
             )
             estatisticas["atualizados"] += 1
@@ -441,6 +544,17 @@ def carregar_historico() -> pd.DataFrame:
         """
     )
     return df
+
+
+def carregar_historico_atualizacoes() -> pd.DataFrame:
+    return consultar_sql(
+        """
+        SELECT data_hora, usuario, documento, placa, composicao,
+               vencimento_anterior, novo_vencimento, origem, acao, importacao_id
+        FROM historico_atualizacoes
+        ORDER BY data_hora DESC, id DESC
+        """
+    )
 
 
 def carregar_ultimo_backup() -> tuple[pd.DataFrame, int | None]:
@@ -600,11 +714,13 @@ def extrair_composicoes_e_fallbacks(df_base: pd.DataFrame) -> tuple[dict, list[d
                     }
                 )
 
-        # Colunas nomeadas permitem trazer IBAMA, CR IBAMA e CRLV da base,
-        # quando o nome da coluna também identifica o equipamento.
+        # Colunas nomeadas permitem trazer os documentos adicionais da base.
+        # Para documentos compartilhados, a composição é representada pelo cavalo.
         for coluna in df_base.columns:
             documento = nome_coluna_para_documento(coluna)
-            if documento not in {"IBAMA", "CR IBAMA", "CRLV"}:
+            if documento not in {
+                "IBAMA", "CR IBAMA", "CRLV", "AETs", "AGENDAMENTO AFERIÇÃO"
+            }:
                 continue
             nome = normalizar_texto(coluna)
             destinos = []
@@ -614,6 +730,8 @@ def extrair_composicoes_e_fallbacks(df_base: pd.DataFrame) -> tuple[dict, list[d
                 destinos = [(carreta_1, "Carreta 1")]
             elif "CARRETA 2" in nome:
                 destinos = [(carreta_2, "Carreta 2")]
+            elif documento in {"IBAMA", "CR IBAMA", "AETs"}:
+                destinos = [(cavalo, "Composição")]
             for placa, equipamento in destinos:
                 vencimento_iso = data_iso(row.get(coluna))
                 if placa and vencimento_iso:
@@ -717,6 +835,8 @@ def resumir_composicoes(df: pd.DataFrame) -> pd.DataFrame:
         "Placa do documento",
         "Documento/Laudo",
         "Data de vencimento",
+        "Alterado em",
+        "Alterado por",
     ]
     if df.empty:
         return pd.DataFrame(columns=colunas)
@@ -726,6 +846,9 @@ def resumir_composicoes(df: pd.DataFrame) -> pd.DataFrame:
 
     temporario = df.copy()
     temporario["vencimento_formatado"] = temporario["vencimento"].dt.strftime("%d/%m/%Y")
+    temporario["alterado_em_formatado"] = temporario["importado_em"].apply(
+        formatar_data_hora
+    )
     resumo = (
         temporario.groupby("composicao", sort=False)
         .agg(
@@ -733,6 +856,8 @@ def resumir_composicoes(df: pd.DataFrame) -> pd.DataFrame:
                 "Placa do documento": ("placa", juntar_unicos),
                 "Documento/Laudo": ("documento", juntar_unicos),
                 "Data de vencimento": ("vencimento_formatado", juntar_unicos),
+                "Alterado em": ("alterado_em_formatado", juntar_unicos),
+                "Alterado por": ("importado_por", juntar_unicos),
             }
         )
         .reset_index()
@@ -741,19 +866,59 @@ def resumir_composicoes(df: pd.DataFrame) -> pd.DataFrame:
     return resumo[colunas]
 
 
+def resumir_afericoes(df: pd.DataFrame) -> pd.DataFrame:
+    colunas = ["Composição", "Data de vencimento"]
+    if df.empty:
+        return pd.DataFrame(columns=colunas)
+    temporario = df.sort_values(["vencimento", "composicao"]).copy()
+    temporario["Data de vencimento"] = temporario["vencimento"].dt.strftime("%d/%m/%Y")
+    return (
+        temporario[["composicao", "Data de vencimento"]]
+        .drop_duplicates()
+        .rename(columns={"composicao": "Composição"})
+        .reset_index(drop=True)
+    )
+
+
+def resumir_ibama_aets(df: pd.DataFrame) -> pd.DataFrame:
+    colunas = ["Documento/Laudo", "Data de vencimento"]
+    if df.empty:
+        return pd.DataFrame(columns=colunas)
+    temporario = df.sort_values(["documento", "vencimento"]).copy()
+    temporario["Data de vencimento"] = temporario["vencimento"].dt.strftime("%d/%m/%Y")
+    return (
+        temporario[["documento", "Data de vencimento"]]
+        .drop_duplicates()
+        .rename(columns={"documento": "Documento/Laudo"})
+        .reset_index(drop=True)
+    )
+
+
+def resumir_crlv(df: pd.DataFrame) -> pd.DataFrame:
+    colunas = ["Placa da composição", "Data de vencimento"]
+    if df.empty:
+        return pd.DataFrame(columns=colunas)
+    temporario = df.sort_values(["vencimento", "placa"]).copy()
+    temporario["Data de vencimento"] = temporario["vencimento"].dt.strftime("%d/%m/%Y")
+    return (
+        temporario[["placa", "Data de vencimento"]]
+        .drop_duplicates()
+        .rename(columns={"placa": "Placa da composição"})
+        .reset_index(drop=True)
+    )
+
+
 def preparar_detalhe(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(
             columns=[
                 "Status", "Composição", "Equipamento", "Placa", "Documento/Laudo",
-                "Vencimento", "Dias", "Origem", "Atualizado por", "Atualizado em",
+                "Vencimento", "Dias", "Origem", "Alterado por", "Alterado em",
             ]
         )
     saida = df.copy()
     saida["vencimento"] = saida["vencimento"].dt.strftime("%d/%m/%Y")
-    saida["importado_em"] = pd.to_datetime(
-        saida["importado_em"], errors="coerce"
-    ).dt.strftime("%d/%m/%Y %H:%M:%S")
+    saida["importado_em"] = saida["importado_em"].apply(formatar_data_hora)
     saida = saida.rename(
         columns={
             "composicao": "Composição",
@@ -762,31 +927,97 @@ def preparar_detalhe(df: pd.DataFrame) -> pd.DataFrame:
             "documento": "Documento/Laudo",
             "vencimento": "Vencimento",
             "origem": "Origem",
-            "importado_por": "Atualizado por",
-            "importado_em": "Atualizado em",
+            "importado_por": "Alterado por",
+            "importado_em": "Alterado em",
         }
     )
     colunas = [
         "Status", "Composição", "Equipamento", "Placa", "Documento/Laudo",
-        "Vencimento", "Dias", "Origem", "Atualizado por", "Atualizado em",
+        "Vencimento", "Dias", "Origem", "Alterado por", "Alterado em",
     ]
     return saida[colunas]
 
 
+def preparar_historico_atualizacoes(df: pd.DataFrame) -> pd.DataFrame:
+    colunas = [
+        "Data/hora da atualização",
+        "Usuário",
+        "Tipo de documento",
+        "Placa ou composição",
+        "Vencimento anterior",
+        "Nova data de vencimento",
+        "Origem da atualização/importação",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=colunas)
+    saida = df.copy()
+    saida["Placa ou composição"] = saida["composicao"].where(
+        saida["composicao"].astype(str).str.strip().ne(""), saida["placa"]
+    )
+    saida["data_hora"] = saida["data_hora"].apply(formatar_data_hora)
+    saida["vencimento_anterior"] = saida["vencimento_anterior"].apply(formatar_data)
+    saida["novo_vencimento"] = saida["novo_vencimento"].apply(formatar_data)
+    saida = saida.rename(
+        columns={
+            "data_hora": "Data/hora da atualização",
+            "usuario": "Usuário",
+            "documento": "Tipo de documento",
+            "vencimento_anterior": "Vencimento anterior",
+            "novo_vencimento": "Nova data de vencimento",
+            "origem": "Origem da atualização/importação",
+        }
+    )
+    return saida[colunas]
+
+
+def mostrar_ultimos_atualizados(
+    auditoria: pd.DataFrame, dados_painel: pd.DataFrame
+) -> None:
+    eventos = pd.DataFrame()
+    if not auditoria.empty and not dados_painel.empty:
+        chaves = dados_painel[["documento", "placa"]].drop_duplicates()
+        eventos = auditoria.merge(chaves, on=["documento", "placa"], how="inner")
+
+    if not eventos.empty:
+        labels = [
+            f"{row.documento} {row.placa}".strip()
+            for row in eventos.itertuples(index=False)
+        ]
+    elif not dados_painel.empty:
+        fallback = dados_painel.sort_values("importado_em", ascending=False)
+        labels = [
+            f"{row.documento} {row.placa}".strip()
+            for row in fallback.itertuples(index=False)
+        ]
+    else:
+        labels = []
+
+    labels = list(dict.fromkeys(labels))[:10]
+    texto = ", ".join(labels) if labels else "Nenhum registro."
+    st.markdown(f"**Últimos atualizados:** {texto}")
+
+
 def painel_status(
-    titulo: str, df: pd.DataFrame, status: list[str], mensagem_vazia: str
+    titulo: str,
+    df: pd.DataFrame,
+    status: list[str],
+    mensagem_vazia: str,
+    auditoria: pd.DataFrame,
 ) -> None:
     st.subheader(titulo)
     dados = df[df["Status"].isin(status)] if not df.empty else df
     if dados.empty:
         st.success(mensagem_vazia)
+        mostrar_ultimos_atualizados(auditoria, dados)
         return
+    resumo = resumir_composicoes(dados)
     st.dataframe(
-        estilizar_tabela(resumir_composicoes(dados)),
+        estilizar_tabela(resumo),
         use_container_width=True,
         hide_index=True,
-        height=min(460, 75 + len(resumir_composicoes(dados)) * 36),
+        height=min(460, 75 + len(resumo) * 36),
     )
+    mostrar_ultimos_atualizados(auditoria, dados)
 
 
 def estilizar_tabela(df: pd.DataFrame):
@@ -809,6 +1040,7 @@ def gerar_excel(
     documentos_filtrados: pd.DataFrame,
     historico: pd.DataFrame,
     importacoes: pd.DataFrame,
+    auditoria: pd.DataFrame,
 ) -> bytes:
     output = BytesIO()
     detalhe = preparar_detalhe(documentos_filtrados)
@@ -818,6 +1050,9 @@ def gerar_excel(
             writer, sheet_name="COMPOSICOES", index=False
         )
         historico.to_excel(writer, sheet_name="HISTORICO", index=False)
+        preparar_historico_atualizacoes(auditoria).to_excel(
+            writer, sheet_name="HISTORICO_ATUALIZACAO", index=False
+        )
         importacoes.to_excel(writer, sheet_name="IMPORTACOES", index=False)
         workbook = writer.book
         formato_cabecalho = workbook.add_format(
@@ -837,6 +1072,7 @@ def gerar_excel(
             "DOCUMENTOS": detalhe,
             "COMPOSICOES": resumir_composicoes(documentos_filtrados),
             "HISTORICO": historico,
+            "HISTORICO_ATUALIZACAO": preparar_historico_atualizacoes(auditoria),
             "IMPORTACOES": importacoes,
         }.items():
             ws = writer.sheets[nome_aba]
@@ -987,6 +1223,7 @@ def main() -> None:
         )
 
     documentos_status = enriquecer_status(documentos_banco, data_referencia)
+    auditoria = carregar_historico_atualizacoes()
     if "filtro_card" not in st.session_state:
         st.session_state.filtro_card = "TODOS"
 
@@ -1046,7 +1283,8 @@ def main() -> None:
     )
     with tab_vencidos:
         painel_status(
-            "Documentos vencidos", filtrados, ["VENCIDO"], "Nenhum documento vencido."
+            "Documentos vencidos", filtrados, ["VENCIDO"],
+            "Nenhum documento vencido.", auditoria
         )
     with tab_semana:
         painel_status(
@@ -1054,6 +1292,7 @@ def main() -> None:
             filtrados,
             ["VENCE HOJE", "VENCE NA SEMANA"],
             "Nenhum documento vence nesta semana.",
+            auditoria,
         )
     with tab_mes:
         painel_status(
@@ -1061,48 +1300,56 @@ def main() -> None:
             filtrados,
             ["VENCE NO MÊS"],
             "Nenhum documento vence no restante do mês.",
+            auditoria,
         )
 
     st.markdown('<div class="faixa">Painéis exclusivos</div>', unsafe_allow_html=True)
-    tab_afericao, tab_ambiental = st.tabs(
-        ["AFERIÇÃO", "IBAMA · CR IBAMA · CRLV"]
+    tab_afericao, tab_ambiental, tab_crlv = st.tabs(
+        ["Aferições", "IBAMA · CR IBAMA · AETs", "CRLV"]
     )
     with tab_afericao:
-        dados = filtrados[filtrados["documento"] == "AFERIÇÃO"]
-        a1, a2, a3 = st.tabs(["Vencidos", "Semana", "Mês"])
-        with a1:
-            painel_status("Aferições vencidas", dados, ["VENCIDO"], "Nenhuma aferição vencida.")
-        with a2:
-            painel_status(
-                "Aferições da semana", dados, ["VENCE HOJE", "VENCE NA SEMANA"],
-                "Nenhuma aferição vence nesta semana."
+        dados = filtrados[
+            filtrados["documento"].isin(["AFERIÇÃO", "AGENDAMENTO AFERIÇÃO"])
+        ]
+        st.subheader("Aferições")
+        if dados.empty:
+            st.info("Nenhuma aferição encontrada para os filtros atuais.")
+        else:
+            st.dataframe(
+                estilizar_tabela(resumir_afericoes(dados)),
+                use_container_width=True,
+                hide_index=True,
+                height=360,
             )
-        with a3:
-            painel_status(
-                "Aferições do mês", dados, ["VENCE NO MÊS"],
-                "Nenhuma aferição vence no restante do mês."
-            )
+        mostrar_ultimos_atualizados(auditoria, dados)
     with tab_ambiental:
         dados = filtrados[
-            filtrados["documento"].isin(["IBAMA", "CR IBAMA", "CRLV"])
+            filtrados["documento"].isin(["IBAMA", "CR IBAMA", "AETs"])
         ]
-        i1, i2, i3 = st.tabs(["Vencidos", "Semana", "Mês"])
-        with i1:
-            painel_status(
-                "IBAMA, CR IBAMA e CRLV vencidos", dados, ["VENCIDO"],
-                "Nenhum documento deste grupo está vencido."
+        st.subheader("IBAMA / CR IBAMA / AETs")
+        if dados.empty:
+            st.info("Nenhum documento deste grupo foi encontrado.")
+        else:
+            st.dataframe(
+                estilizar_tabela(resumir_ibama_aets(dados)),
+                use_container_width=True,
+                hide_index=True,
+                height=280,
             )
-        with i2:
-            painel_status(
-                "IBAMA, CR IBAMA e CRLV da semana", dados,
-                ["VENCE HOJE", "VENCE NA SEMANA"],
-                "Nenhum documento deste grupo vence nesta semana."
+        mostrar_ultimos_atualizados(auditoria, dados)
+    with tab_crlv:
+        dados = filtrados[filtrados["documento"] == "CRLV"]
+        st.subheader("CRLV")
+        if dados.empty:
+            st.info("Nenhum CRLV foi encontrado para os filtros atuais.")
+        else:
+            st.dataframe(
+                estilizar_tabela(resumir_crlv(dados)),
+                use_container_width=True,
+                hide_index=True,
+                height=360,
             )
-        with i3:
-            painel_status(
-                "IBAMA, CR IBAMA e CRLV do mês", dados, ["VENCE NO MÊS"],
-                "Nenhum documento deste grupo vence no restante do mês."
-            )
+        mostrar_ultimos_atualizados(auditoria, dados)
 
     st.markdown(
         '<div class="faixa">Composições com documentos no filtro</div>',
@@ -1114,6 +1361,7 @@ def main() -> None:
         hide_index=True,
         height=390,
     )
+    mostrar_ultimos_atualizados(auditoria, filtrados)
 
     with st.expander("Detalhes, histórico e backup", expanded=False):
         tab_detalhe, tab_historico, tab_backup, tab_importacoes = st.tabs(
@@ -1150,7 +1398,7 @@ def main() -> None:
                 hide_index=True, height=360
             )
 
-        excel = gerar_excel(filtrados, historico, importacoes)
+        excel = gerar_excel(filtrados, historico, importacoes, auditoria)
         st.download_button(
             "Baixar relatório e histórico em Excel",
             data=excel,
@@ -1164,6 +1412,21 @@ def main() -> None:
         "documento. O maior vencimento permanece ativo; duplicatas e datas mais antigas "
         "são ignoradas. Antes de cada importação, o estado completo do banco é salvo."
     )
+
+    st.markdown(
+        '<div class="faixa">Histórico de Atualização</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Auditoria das inserções e alterações registradas no banco de dados."
+    )
+    st.dataframe(
+        estilizar_tabela(preparar_historico_atualizacoes(auditoria)),
+        use_container_width=True,
+        hide_index=True,
+        height=430,
+    )
+    mostrar_ultimos_atualizados(auditoria, documentos_status)
 
 
 if __name__ == "__main__":

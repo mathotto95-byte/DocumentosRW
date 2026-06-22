@@ -17,8 +17,8 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "painel_vencimentos.db"
 
-COR_CABECALHO = "#B5911B"
-COR_TEXTO = "#020D3F"
+COR_CABECALHO = "#020D3F"
+COR_TEXTO = "#B5911B"
 
 TIPOS_DOCUMENTO = [
     "CIV",

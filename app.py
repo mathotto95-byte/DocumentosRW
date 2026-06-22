@@ -96,6 +96,35 @@ def converter_data(valor):
     return pd.NaT if pd.isna(data_convertida) else pd.Timestamp(data_convertida).normalize()
 
 
+def converter_data_hora_iso(valor) -> str:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return ""
+    if isinstance(valor, pd.Timestamp):
+        convertido = valor.to_pydatetime()
+    elif isinstance(valor, datetime):
+        convertido = valor
+    elif isinstance(valor, date):
+        convertido = datetime.combine(valor, datetime.min.time())
+    else:
+        try:
+            numero = float(valor)
+            if not 30000 <= numero <= 60000:
+                return ""
+            convertido = datetime(1899, 12, 30) + timedelta(days=numero)
+        except (TypeError, ValueError):
+            texto = str(valor).strip()
+            if not texto:
+                return ""
+            if re.match(r"^\d{4}-\d{2}-\d{2}", texto):
+                convertido = pd.to_datetime(texto, errors="coerce")
+            else:
+                convertido = pd.to_datetime(texto, dayfirst=True, errors="coerce")
+            if pd.isna(convertido):
+                return ""
+            convertido = convertido.to_pydatetime()
+    return convertido.isoformat(timespec="seconds")
+
+
 def classificar_documento(valor) -> str | None:
     texto = normalizar_texto(valor)
     if not texto:
@@ -361,7 +390,17 @@ def salvar_importacao(
     for registro in registros:
         chave = (registro["placa"], registro["documento"])
         anterior = consolidados.get(chave)
-        if anterior is None or registro["vencimento"] > anterior["vencimento"]:
+        prioridade_registro = (
+            registro["vencimento"],
+            registro.get("alterado_em_origem", ""),
+            registro.get("origem") == "PLANILHA DE DOCUMENTOS",
+        )
+        prioridade_anterior = (
+            anterior["vencimento"],
+            anterior.get("alterado_em_origem", ""),
+            anterior.get("origem") == "PLANILHA DE DOCUMENTOS",
+        ) if anterior else None
+        if anterior is None or prioridade_registro > prioridade_anterior:
             consolidados[chave] = registro
 
     with conectar() as conn:
@@ -393,6 +432,8 @@ def salvar_importacao(
         )
 
         for registro in consolidados.values():
+            alterado_em_registro = registro.get("alterado_em_origem") or momento
+            alterado_por_registro = registro.get("alterado_por_origem") or usuario
             existente = conn.execute(
                 "SELECT * FROM documentos WHERE placa = ? AND documento = ?",
                 (registro["placa"], registro["documento"]),
@@ -411,8 +452,8 @@ def salvar_importacao(
                         registro["placa"], registro["documento"], registro["vencimento"],
                         registro["composicao"], registro["placa_cavalo"],
                         registro["placa_carreta_1"], registro["placa_carreta_2"],
-                        registro["equipamento"], registro["origem"], momento,
-                        usuario, importacao_id,
+                        registro["equipamento"], registro["origem"],
+                        alterado_em_registro, alterado_por_registro, importacao_id,
                     ),
                 )
                 conn.execute(
@@ -424,7 +465,8 @@ def salvar_importacao(
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        momento, usuario, registro["documento"], registro["placa"],
+                        alterado_em_registro, alterado_por_registro,
+                        registro["documento"], registro["placa"],
                         registro["composicao"], None, registro["vencimento"],
                         registro["origem"], "INSERÇÃO", importacao_id,
                     ),
@@ -432,8 +474,52 @@ def salvar_importacao(
                 estatisticas["inseridos"] += 1
                 continue
 
-            if registro["vencimento"] <= existente["vencimento"]:
+            if registro["vencimento"] < existente["vencimento"]:
                 estatisticas["ignorados"] += 1
+                continue
+
+            if registro["vencimento"] == existente["vencimento"]:
+                alterado_em_origem = registro.get("alterado_em_origem", "")
+                mesmos_dados_controle = (
+                    alterado_em_origem == existente["importado_em"]
+                    and alterado_por_registro == existente["importado_por"]
+                )
+                if not alterado_em_origem or mesmos_dados_controle:
+                    estatisticas["ignorados"] += 1
+                    continue
+                conn.execute(
+                    """
+                    UPDATE documentos SET
+                        composicao = ?, placa_cavalo = ?, placa_carreta_1 = ?,
+                        placa_carreta_2 = ?, equipamento = ?, origem = ?,
+                        importado_em = ?, importado_por = ?, importacao_id = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        registro["composicao"], registro["placa_cavalo"],
+                        registro["placa_carreta_1"], registro["placa_carreta_2"],
+                        registro["equipamento"], registro["origem"],
+                        alterado_em_registro, alterado_por_registro, importacao_id,
+                        existente["id"],
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO historico_atualizacoes (
+                        data_hora, usuario, documento, placa, composicao,
+                        vencimento_anterior, novo_vencimento, origem, acao,
+                        importacao_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        alterado_em_registro, alterado_por_registro,
+                        registro["documento"], registro["placa"],
+                        registro["composicao"], existente["vencimento"],
+                        registro["vencimento"], registro["origem"],
+                        "ATUALIZAÇÃO DE CONTROLE", importacao_id,
+                    ),
+                )
+                estatisticas["atualizados"] += 1
                 continue
 
             conn.execute(
@@ -467,7 +553,8 @@ def salvar_importacao(
                     registro["vencimento"], registro["composicao"],
                     registro["placa_cavalo"], registro["placa_carreta_1"],
                     registro["placa_carreta_2"], registro["equipamento"],
-                    registro["origem"], momento, usuario, importacao_id,
+                    registro["origem"], alterado_em_registro,
+                    alterado_por_registro, importacao_id,
                     existente["id"],
                 ),
             )
@@ -480,7 +567,8 @@ def salvar_importacao(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    momento, usuario, registro["documento"], registro["placa"],
+                    alterado_em_registro, alterado_por_registro,
+                    registro["documento"], registro["placa"],
                     registro["composicao"], existente["vencimento"],
                     registro["vencimento"], registro["origem"], "ALTERAÇÃO",
                     importacao_id,
@@ -637,6 +725,16 @@ def extrair_documentos_origem(df: pd.DataFrame) -> list[dict]:
     )
     if col_vencimento is None:
         col_vencimento = localizar_coluna(df.columns, [], contem=["VALIDADE"])
+    col_alterado_em = localizar_coluna(
+        df.columns,
+        ["ALTERADO EM", "ATUALIZADO EM", "MODIFICADO EM", "DATA DA ALTERAÇÃO"],
+        contem=["ALTERADO", "EM"],
+    )
+    col_alterado_por = localizar_coluna(
+        df.columns,
+        ["ALTERADO POR", "ATUALIZADO POR", "MODIFICADO POR", "USUÁRIO"],
+        contem=["ALTERADO", "POR"],
+    )
     if col_placa is None or col_tipo is None or col_vencimento is None:
         raise ValueError("A planilha de documentos não possui as colunas obrigatórias.")
 
@@ -646,12 +744,21 @@ def extrair_documentos_origem(df: pd.DataFrame) -> list[dict]:
         documento = classificar_documento(row.get(col_tipo))
         vencimento = data_iso(row.get(col_vencimento))
         if placa and documento and vencimento:
+            valor_usuario = row.get(col_alterado_por) if col_alterado_por else ""
+            alterado_por = (
+                "" if valor_usuario is None or pd.isna(valor_usuario)
+                else str(valor_usuario).strip()
+            )
             registros.append(
                 {
                     "placa": placa,
                     "documento": documento,
                     "vencimento": vencimento,
                     "origem": "PLANILHA DE DOCUMENTOS",
+                    "alterado_em_origem": converter_data_hora_iso(
+                        row.get(col_alterado_em) if col_alterado_em else None
+                    ),
+                    "alterado_por_origem": alterado_por,
                 }
             )
     return registros

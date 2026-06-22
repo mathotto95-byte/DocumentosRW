@@ -1,6 +1,10 @@
 import re
-from io import BytesIO
+import sqlite3
+import unicodedata
 from datetime import date, datetime, timedelta
+from io import BytesIO
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -9,66 +13,66 @@ import streamlit as st
 # =========================================================
 # CONFIGURAÇÕES
 # =========================================================
-DOCUMENTOS_COMPOSICAO = [
-    "Cavalo - CIV",
-    "Cavalo - Cronotacógrafo",
-    "Carreta 1 - CIV",
-    "Carreta 1 - CIPP",
-    "Carreta 1 - Aferição",
-    "Carreta 2 - CIV",
-    "Carreta 2 - CIPP",
-    "Carreta 2 - Aferição",
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+DB_PATH = DATA_DIR / "painel_vencimentos.db"
+
+COR_CABECALHO = "#B5911B"
+COR_TEXTO = "#020D3F"
+
+TIPOS_DOCUMENTO = [
+    "CIV",
+    "CIPP",
+    "AFERIÇÃO",
+    "CRONOTACÓGRAFO",
+    "IBAMA",
+    "CR IBAMA",
+    "CRLV",
 ]
 
-COLUNAS_VISUAIS = [
-    "Status geral",
-    "Composição",
-    "Placa Cavalo",
-    "Placa Carreta 1",
-    "Placa Carreta 2",
-    "Documento em alerta",
-    "Vencimento em alerta",
-    "Dias alerta",
-    "Próximo documento",
-    "Próximo vencimento",
-    "Dias próximo",
-    *DOCUMENTOS_COMPOSICAO,
-    "Documentos no filtro",
-]
+STATUS_ORDEM = {
+    "VENCIDO": 0,
+    "VENCE HOJE": 1,
+    "VENCE NA SEMANA": 2,
+    "VENCE NO MÊS": 3,
+    "OK": 4,
+    "SEM DATA": 5,
+}
 
 
 # =========================================================
 # UTILIDADES
 # =========================================================
+def agora_local() -> datetime:
+    try:
+        return datetime.now(ZoneInfo("America/Sao_Paulo"))
+    except Exception:
+        return datetime.now().astimezone()
+
+
 def normalizar_texto(valor) -> str:
-    """Remove acentos, espaços duplicados e padroniza em maiúsculas."""
-    if pd.isna(valor):
+    if valor is None or pd.isna(valor):
         return ""
-    texto = str(valor).strip().upper()
-    mapa = str.maketrans(
-        "ÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇáàâãäéèêëíìîïóòôõöúùûüç",
-        "AAAAAEEEEIIIIOOOOOUUUUCaaaaaeeeeiiiiooooouuuuc",
-    )
-    texto = texto.translate(mapa)
-    return re.sub(r"\s+", " ", texto).strip()
+    texto = unicodedata.normalize("NFKD", str(valor).strip())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    return re.sub(r"\s+", " ", texto.upper()).strip()
 
 
 def limpar_placa(valor) -> str:
-    return normalizar_texto(valor).replace(" ", "").replace("-", "")
+    return re.sub(r"[^A-Z0-9]", "", normalizar_texto(valor))
 
 
 def data_excel_serial(valor):
     try:
         numero = float(valor)
-    except Exception:
+    except (TypeError, ValueError):
         return pd.NaT
-    if not (30000 <= numero <= 60000):
+    if not 30000 <= numero <= 60000:
         return pd.NaT
     return pd.Timestamp(datetime(1899, 12, 30) + timedelta(days=numero)).normalize()
 
 
 def converter_data(valor):
-    """Aceita data do Excel, número serial ou texto dd/mm/aaaa."""
     if valor is None or (isinstance(valor, float) and pd.isna(valor)):
         return pd.NaT
     if isinstance(valor, pd.Timestamp):
@@ -77,273 +81,41 @@ def converter_data(valor):
         return pd.Timestamp(valor).normalize()
     if isinstance(valor, date):
         return pd.Timestamp(valor).normalize()
-
     serial = data_excel_serial(valor)
     if not pd.isna(serial):
         return serial
-
     texto = str(valor).strip()
-    if texto == "":
+    if not texto:
         return pd.NaT
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", texto):
+        data_convertida = pd.to_datetime(texto, format="%Y-%m-%d", errors="coerce")
+    else:
+        data_convertida = pd.to_datetime(texto, dayfirst=True, errors="coerce")
+    return pd.NaT if pd.isna(data_convertida) else pd.Timestamp(data_convertida).normalize()
 
-    data = pd.to_datetime(texto, dayfirst=True, errors="coerce")
-    if pd.isna(data):
-        return pd.NaT
-    return pd.Timestamp(data).normalize()
 
-
-def classificar_laudo(valor) -> str | None:
-    """Classifica os laudos do KMM para os documentos usados na base."""
+def classificar_documento(valor) -> str | None:
     texto = normalizar_texto(valor)
+    if not texto:
+        return None
+    if "CR IBAMA" in texto or "CERTIFICADO DE REGULARIDADE" in texto:
+        return "CR IBAMA"
+    if "CRLV" in texto:
+        return "CRLV"
+    if "IBAMA" in texto:
+        return "IBAMA"
     if "CIPP" in texto:
         return "CIPP"
-    if "CIV" in texto:
+    if re.search(r"(^|\W)CIV($|\W)", texto):
         return "CIV"
-    if "AFERICAO" in texto or "AFER" in texto:
+    if "AFERICAO" in texto or texto.startswith("AFER"):
         return "AFERIÇÃO"
     if "CRONOT" in texto:
         return "CRONOTACÓGRAFO"
     return None
 
 
-def formatar_data(valor):
-    data = converter_data(valor)
-    if pd.isna(data):
-        return ""
-    return data.strftime("%d/%m/%Y")
-
-
-def status_vencimento(vencimento, ref: pd.Timestamp, fim_semana: pd.Timestamp, fim_mes: pd.Timestamp) -> str:
-    if pd.isna(vencimento):
-        return "SEM DATA"
-    if vencimento < ref:
-        return "VENCIDO"
-    if vencimento == ref:
-        return "VENCE HOJE"
-    if ref < vencimento <= fim_semana:
-        return "VENCE NA SEMANA"
-    if fim_semana < vencimento <= fim_mes:
-        return "VENCE NO MÊS"
-    return "OK"
-
-
-def status_prioridade(status: str) -> int:
-    """Ordena status mesmo quando o texto vier com o documento no final.
-    Ex.: "VENCE HOJE: Carreta 1 - AFERIÇÃO" continua com prioridade VENCE HOJE.
-    """
-    base = normalizar_texto(str(status).split(":")[0])
-    ordem = {
-        "VENCIDO": 0,
-        "VENCE HOJE": 1,
-        "VENCE NA SEMANA": 2,
-        "VENCE NO MES": 3,
-        "OK": 4,
-        "SEM DATA": 5,
-    }
-    return ordem.get(base, 9)
-
-
-def label_documento(equipamento: str, placa: str, documento: str) -> str:
-    placa_limpa = limpar_placa(placa)
-    return f"{equipamento} {placa_limpa} - {documento}".strip()
-
-
-def resumir_documentos(itens: list[dict], limite: int = 2, com_data: bool = True) -> str:
-    partes = []
-    for item in itens[:limite]:
-        texto = label_documento(item.get("equipamento", ""), item.get("placa", ""), item.get("documento", ""))
-        venc = item.get("vencimento")
-        if com_data and venc is not None and not pd.isna(venc):
-            texto += f" ({pd.Timestamp(venc).strftime('%d/%m/%Y')})"
-        partes.append(texto)
-    if len(itens) > limite:
-        partes.append(f"+{len(itens) - limite} doc.")
-    return "; ".join(partes)
-
-
-def montar_status_composicao(documentos: list[tuple], ref: pd.Timestamp, fim_semana: pd.Timestamp, fim_mes: pd.Timestamp) -> dict:
-    """Monta o status geral da composição com o documento de alerta e o próximo vencimento.
-
-    A regra é dinâmica pela data de referência:
-    - se o documento vence hoje, aparece em VENCE HOJE;
-    - no dia seguinte, o mesmo documento passa para VENCIDO;
-    - quando há vencidos, o painel também mostra o próximo documento futuro da composição.
-    """
-    itens = []
-    for equipamento, placa, documento, vencimento, origem, coluna_data in documentos:
-        if not placa or pd.isna(vencimento):
-            continue
-        vencimento = pd.Timestamp(vencimento).normalize()
-        itens.append(
-            {
-                "equipamento": equipamento,
-                "placa": limpar_placa(placa),
-                "documento": documento,
-                "vencimento": vencimento,
-                "dias": int((vencimento - ref).days),
-                "status": status_vencimento(vencimento, ref, fim_semana, fim_mes),
-            }
-        )
-
-    if not itens:
-        return {
-            "Status categoria": "SEM DATA",
-            "Status geral": "SEM DATA",
-            "Documento em alerta": "",
-            "Vencimento em alerta": pd.NaT,
-            "Dias alerta": "",
-            "Próximo documento": "",
-            "Próximo vencimento": pd.NaT,
-            "Dias próximo": "",
-            "Vencimento mais próximo": pd.NaT,
-            "Dias p/ vencer": "",
-        }
-
-    grupos = {
-        "VENCIDO": sorted([i for i in itens if i["status"] == "VENCIDO"], key=lambda x: x["vencimento"]),
-        "VENCE HOJE": sorted([i for i in itens if i["status"] == "VENCE HOJE"], key=lambda x: x["vencimento"]),
-        "VENCE NA SEMANA": sorted([i for i in itens if i["status"] == "VENCE NA SEMANA"], key=lambda x: x["vencimento"]),
-        "VENCE NO MÊS": sorted([i for i in itens if i["status"] == "VENCE NO MÊS"], key=lambda x: x["vencimento"]),
-    }
-
-    status_categoria = "OK"
-    alertas = []
-    for status in ["VENCIDO", "VENCE HOJE", "VENCE NA SEMANA", "VENCE NO MÊS"]:
-        if grupos[status]:
-            status_categoria = status
-            alertas = grupos[status]
-            break
-
-    if not alertas:
-        futuros_ok = sorted([i for i in itens if i["vencimento"] > ref], key=lambda x: x["vencimento"])
-        alertas = futuros_ok[:1]
-
-    alerta_principal = alertas[0] if alertas else None
-    futuros = sorted([i for i in itens if i["vencimento"] > ref], key=lambda x: x["vencimento"])
-    proximo = futuros[0] if futuros else None
-
-    if status_categoria == "OK":
-        status_geral = "OK"
-    else:
-        status_geral = f"{status_categoria}: {resumir_documentos(alertas, limite=2, com_data=True)}"
-
-    return {
-        "Status categoria": status_categoria,
-        "Status geral": status_geral,
-        "Documento em alerta": resumir_documentos(alertas, limite=3, com_data=False),
-        "Vencimento em alerta": alerta_principal["vencimento"] if alerta_principal else pd.NaT,
-        "Dias alerta": alerta_principal["dias"] if alerta_principal else "",
-        "Próximo documento": resumir_documentos([proximo], limite=1, com_data=False) if proximo else "",
-        "Próximo vencimento": proximo["vencimento"] if proximo else pd.NaT,
-        "Dias próximo": proximo["dias"] if proximo else "",
-        # Campos mantidos para compatibilidade com ordenação/exportação: representam o alerta principal.
-        "Vencimento mais próximo": alerta_principal["vencimento"] if alerta_principal else pd.NaT,
-        "Dias p/ vencer": alerta_principal["dias"] if alerta_principal else "",
-    }
-
-
-# =========================================================
-# LEITURA DAS PLANILHAS
-# =========================================================
-def localizar_linha_cabecalho_kmm(df_bruto: pd.DataFrame) -> int:
-    """Localiza a linha que contém Placa, Laudo e Data Vencimento."""
-    for i in range(min(20, len(df_bruto))):
-        linha = [normalizar_texto(x) for x in df_bruto.iloc[i].tolist()]
-        tem_placa = "PLACA" in linha
-        tem_laudo = "LAUDO" in linha
-        tem_venc = "DATA VENCIMENTO" in linha or "VENCIMENTO" in linha
-        if tem_placa and tem_laudo and tem_venc:
-            return i
-    raise ValueError("Não localizei o cabeçalho do KMM com Placa, Laudo e Data Vencimento.")
-
-
-def criar_nomes_unicos(colunas):
-    usados = {}
-    novas = []
-    for c in colunas:
-        base = normalizar_texto(c) or "COLUNA"
-        usados[base] = usados.get(base, 0) + 1
-        if usados[base] == 1:
-            novas.append(base)
-        else:
-            novas.append(f"{base}_{usados[base]}")
-    return novas
-
-
-def ler_kmm(arquivo, aba: str) -> pd.DataFrame:
-    bruto = pd.read_excel(arquivo, sheet_name=aba, header=None, dtype=object)
-    linha_cab = localizar_linha_cabecalho_kmm(bruto)
-    colunas = criar_nomes_unicos(bruto.iloc[linha_cab].tolist())
-    df = bruto.iloc[linha_cab + 1 :].copy()
-    df.columns = colunas
-    df = df.dropna(how="all")
-    return df
-
-
-def ler_base(arquivo, aba: str) -> pd.DataFrame:
-    df = pd.read_excel(arquivo, sheet_name=aba, dtype=object)
-    df = df.dropna(how="all")
-    return df
-
-
-# =========================================================
-# REGRA PRINCIPAL
-# =========================================================
-def montar_indice_kmm(df_kmm: pd.DataFrame) -> dict[tuple[str, str], pd.Timestamp]:
-    col_placa = "PLACA"
-    col_laudo = "LAUDO"
-
-    col_venc = None
-    for candidato in ["DATA VENCIMENTO", "VENCIMENTO", "DATA DE VENCIMENTO"]:
-        if candidato in df_kmm.columns:
-            col_venc = candidato
-            break
-
-    obrigatorias = [col_placa, col_laudo]
-    faltantes = [c for c in obrigatorias if c not in df_kmm.columns]
-    if col_venc is None:
-        faltantes.append("DATA VENCIMENTO")
-    if faltantes:
-        raise ValueError(f"Colunas obrigatórias não encontradas no KMM: {faltantes}")
-
-    indice = {}
-    for _, row in df_kmm.iterrows():
-        placa = limpar_placa(row.get(col_placa))
-        documento = classificar_laudo(row.get(col_laudo))
-        vencimento = converter_data(row.get(col_venc))
-        if not placa or not documento or pd.isna(vencimento):
-            continue
-
-        chave = (placa, documento)
-        # Mantém o maior vencimento para considerar o laudo vigente.
-        if chave not in indice or vencimento > indice[chave]:
-            indice[chave] = vencimento
-    return indice
-
-
-def escolher_vencimento(indice_kmm: dict, placa: str, documento: str, fallback_base):
-    placa = limpar_placa(placa)
-    venc_kmm = indice_kmm.get((placa, documento)) if placa else pd.NaT
-    if venc_kmm is not None and not pd.isna(venc_kmm):
-        return venc_kmm, "KMM"
-
-    venc_base = converter_data(fallback_base)
-    if not pd.isna(venc_base):
-        return venc_base, "BASE"
-
-    return pd.NaT, ""
-
-
-def menor_data(datas):
-    validas = [d for d in datas if d is not None and not pd.isna(d)]
-    return min(validas) if validas else pd.NaT
-
-
-def montar_relatorios(
-    df_base: pd.DataFrame,
-    indice_kmm: dict,
-    data_referencia: date,
-):
+def periodos(data_referencia: date) -> dict:
     ref = pd.Timestamp(data_referencia).normalize()
     inicio_semana = ref - pd.Timedelta(days=ref.weekday())
     fim_semana = inicio_semana + pd.Timedelta(days=6)
@@ -352,568 +124,1047 @@ def montar_relatorios(
         fim_mes = pd.Timestamp(date(ref.year, 12, 31))
     else:
         fim_mes = pd.Timestamp(date(ref.year, ref.month + 1, 1)) - pd.Timedelta(days=1)
-
-    atualizada = []
-    detalhe = []
-
-    for _, row in df_base.iterrows():
-        valores = row.tolist()
-        if len(valores) < 8:
-            continue
-
-        cavalo = limpar_placa(valores[0])
-        carreta1 = limpar_placa(valores[3]) if len(valores) > 3 else ""
-        carreta2 = limpar_placa(valores[4]) if len(valores) > 4 else ""
-
-        if not cavalo and not carreta1 and not carreta2:
-            continue
-
-        cav_civ, src_cav_civ = escolher_vencimento(indice_kmm, cavalo, "CIV", valores[1] if len(valores) > 1 else None)
-        cav_crono, src_cav_crono = escolher_vencimento(indice_kmm, cavalo, "CRONOTACÓGRAFO", valores[2] if len(valores) > 2 else None)
-
-        car1_civ, src_car1_civ = escolher_vencimento(indice_kmm, carreta1, "CIV", valores[5] if len(valores) > 5 else None)
-        car2_civ, src_car2_civ = escolher_vencimento(indice_kmm, carreta2, "CIV", valores[5] if len(valores) > 5 else None)
-        car1_cipp, src_car1_cipp = escolher_vencimento(indice_kmm, carreta1, "CIPP", valores[6] if len(valores) > 6 else None)
-        car2_cipp, src_car2_cipp = escolher_vencimento(indice_kmm, carreta2, "CIPP", valores[6] if len(valores) > 6 else None)
-        car1_afer, src_car1_afer = escolher_vencimento(indice_kmm, carreta1, "AFERIÇÃO", valores[7] if len(valores) > 7 else None)
-        car2_afer, src_car2_afer = escolher_vencimento(indice_kmm, carreta2, "AFERIÇÃO", valores[7] if len(valores) > 7 else None)
-
-        documentos = [
-            ("Cavalo", cavalo, "CIV", cav_civ, src_cav_civ, "Cavalo - CIV"),
-            ("Cavalo", cavalo, "CRONOTACÓGRAFO", cav_crono, src_cav_crono, "Cavalo - Cronotacógrafo"),
-            ("Carreta 1", carreta1, "CIV", car1_civ, src_car1_civ, "Carreta 1 - CIV"),
-            ("Carreta 1", carreta1, "CIPP", car1_cipp, src_car1_cipp, "Carreta 1 - CIPP"),
-            ("Carreta 1", carreta1, "AFERIÇÃO", car1_afer, src_car1_afer, "Carreta 1 - Aferição"),
-            ("Carreta 2", carreta2, "CIV", car2_civ, src_car2_civ, "Carreta 2 - CIV"),
-            ("Carreta 2", carreta2, "CIPP", car2_cipp, src_car2_cipp, "Carreta 2 - CIPP"),
-            ("Carreta 2", carreta2, "AFERIÇÃO", car2_afer, src_car2_afer, "Carreta 2 - Aferição"),
-        ]
-
-        composicao = f"{cavalo} + {carreta1} + {carreta2}".strip(" +")
-        info_status = montar_status_composicao(documentos, ref, fim_semana, fim_mes)
-
-        registro = {
-            "Status categoria": info_status["Status categoria"],
-            "Status geral": info_status["Status geral"],
-            "Composição": composicao,
-            "Placa Cavalo": cavalo,
-            "Placa Carreta 1": carreta1,
-            "Placa Carreta 2": carreta2,
-            "Documento em alerta": info_status["Documento em alerta"],
-            "Vencimento em alerta": info_status["Vencimento em alerta"],
-            "Dias alerta": info_status["Dias alerta"],
-            "Próximo documento": info_status["Próximo documento"],
-            "Próximo vencimento": info_status["Próximo vencimento"],
-            "Dias próximo": info_status["Dias próximo"],
-            "Cavalo - CIV": cav_civ,
-            "Cavalo - Cronotacógrafo": cav_crono,
-            "Carreta 1 - CIV": car1_civ,
-            "Carreta 1 - CIPP": car1_cipp,
-            "Carreta 1 - Aferição": car1_afer,
-            "Carreta 2 - CIV": car2_civ,
-            "Carreta 2 - CIPP": car2_cipp,
-            "Carreta 2 - Aferição": car2_afer,
-            "Vencimento mais próximo": info_status["Vencimento mais próximo"],
-            "Dias p/ vencer": info_status["Dias p/ vencer"],
-            "Documentos no filtro": "",
-        }
-        atualizada.append(registro)
-
-        for equipamento, placa, documento, vencimento, origem, coluna_data in documentos:
-            if not placa or pd.isna(vencimento):
-                continue
-            dias_doc = int((vencimento - ref).days)
-            status_doc = status_vencimento(vencimento, ref, fim_semana, fim_mes)
-            detalhe.append(
-                {
-                    "Status": status_doc,
-                    "Composição": composicao,
-                    "Equipamento": equipamento,
-                    "Placa": placa,
-                    "Documento": documento,
-                    "Vencimento": vencimento,
-                    "Dias p/ vencer": dias_doc,
-                    "Origem atualização": origem,
-                    "Placa Cavalo": cavalo,
-                    "Placa Carreta 1": carreta1,
-                    "Placa Carreta 2": carreta2,
-                    "Coluna na composição": coluna_data,
-                }
-            )
-
-    df_atualizada = pd.DataFrame(atualizada)
-    df_detalhe = pd.DataFrame(detalhe)
-
-    if not df_atualizada.empty:
-        df_atualizada["_ordem_status"] = df_atualizada["Status geral"].map(status_prioridade)
-        df_atualizada = df_atualizada.sort_values(["_ordem_status", "Vencimento mais próximo", "Composição"]).drop(columns=["_ordem_status"])
-
-    if not df_detalhe.empty:
-        df_detalhe["_ordem_status"] = df_detalhe["Status"].map(status_prioridade)
-        df_detalhe = df_detalhe.sort_values(["_ordem_status", "Vencimento", "Composição", "Documento"]).drop(columns=["_ordem_status"])
-
     return {
-        "base_atualizada": df_atualizada,
-        "detalhe_documentos": df_detalhe,
-        "vencidos": filtrar_por_status(df_atualizada, df_detalhe, ["VENCIDO"]),
-        "vencem_hoje": filtrar_por_status(df_atualizada, df_detalhe, ["VENCE HOJE"]),
-        "vencem_semana": filtrar_por_status(df_atualizada, df_detalhe, ["VENCE NA SEMANA"]),
-        "vencem_mes": filtrar_por_status(df_atualizada, df_detalhe, ["VENCE NO MÊS"]),
+        "ref": ref,
         "inicio_semana": inicio_semana,
         "fim_semana": fim_semana,
         "inicio_mes": inicio_mes,
         "fim_mes": fim_mes,
-        "data_referencia": ref,
     }
 
 
-def filtrar_por_status(df_base: pd.DataFrame, df_detalhe: pd.DataFrame, status_lista: list[str]) -> pd.DataFrame:
-    if df_base.empty or df_detalhe.empty:
-        return pd.DataFrame(columns=COLUNAS_VISUAIS)
+def status_vencimento(vencimento, data_referencia: date) -> str:
+    vencimento = converter_data(vencimento)
+    if pd.isna(vencimento):
+        return "SEM DATA"
+    p = periodos(data_referencia)
+    if vencimento < p["ref"]:
+        return "VENCIDO"
+    if vencimento == p["ref"]:
+        return "VENCE HOJE"
+    if vencimento <= p["fim_semana"]:
+        return "VENCE NA SEMANA"
+    if vencimento <= p["fim_mes"]:
+        return "VENCE NO MÊS"
+    return "OK"
 
-    detalhe_filtrado = df_detalhe[df_detalhe["Status"].isin(status_lista)].copy()
-    if detalhe_filtrado.empty:
-        return pd.DataFrame(columns=COLUNAS_VISUAIS)
 
-    def item_longo(row):
-        return (
-            f"{row['Equipamento']} {row['Placa']} - {row['Documento']}: "
-            f"{pd.Timestamp(row['Vencimento']).strftime('%d/%m/%Y')} "
-            f"({int(row['Dias p/ vencer'])} dias)"
+def valor_posicional(row: pd.Series, indice: int):
+    return row.iloc[indice] if indice < len(row) else None
+
+
+def data_iso(valor) -> str | None:
+    convertido = converter_data(valor)
+    return None if pd.isna(convertido) else convertido.strftime("%Y-%m-%d")
+
+
+def formatar_data(valor) -> str:
+    convertido = converter_data(valor)
+    return "" if pd.isna(convertido) else convertido.strftime("%d/%m/%Y")
+
+
+def criar_nomes_unicos(colunas) -> list[str]:
+    usados: dict[str, int] = {}
+    novas = []
+    for coluna in colunas:
+        base = normalizar_texto(coluna) or "COLUNA"
+        usados[base] = usados.get(base, 0) + 1
+        novas.append(base if usados[base] == 1 else f"{base}_{usados[base]}")
+    return novas
+
+
+# =========================================================
+# BANCO DE DADOS, BACKUP E AUDITORIA
+# =========================================================
+def conectar() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conexao = sqlite3.connect(DB_PATH, timeout=30)
+    conexao.row_factory = sqlite3.Row
+    conexao.execute("PRAGMA foreign_keys = ON")
+    conexao.execute("PRAGMA journal_mode = WAL")
+    return conexao
+
+
+def inicializar_banco() -> None:
+    with conectar() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS importacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_hora TEXT NOT NULL,
+                usuario TEXT NOT NULL,
+                arquivo_base TEXT,
+                arquivo_documentos TEXT,
+                total_recebidos INTEGER NOT NULL DEFAULT 0,
+                inseridos INTEGER NOT NULL DEFAULT 0,
+                atualizados INTEGER NOT NULL DEFAULT 0,
+                ignorados INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS documentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                placa TEXT NOT NULL,
+                documento TEXT NOT NULL,
+                vencimento TEXT NOT NULL,
+                composicao TEXT NOT NULL,
+                placa_cavalo TEXT,
+                placa_carreta_1 TEXT,
+                placa_carreta_2 TEXT,
+                equipamento TEXT,
+                origem TEXT,
+                importado_em TEXT NOT NULL,
+                importado_por TEXT NOT NULL,
+                importacao_id INTEGER,
+                UNIQUE (placa, documento),
+                FOREIGN KEY (importacao_id) REFERENCES importacoes(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS historico_documentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                documento_id_original INTEGER,
+                placa TEXT NOT NULL,
+                documento TEXT NOT NULL,
+                vencimento TEXT NOT NULL,
+                composicao TEXT NOT NULL,
+                placa_cavalo TEXT,
+                placa_carreta_1 TEXT,
+                placa_carreta_2 TEXT,
+                equipamento TEXT,
+                origem TEXT,
+                importado_em TEXT,
+                importado_por TEXT,
+                importacao_original_id INTEGER,
+                substituido_em TEXT NOT NULL,
+                substituido_por TEXT NOT NULL,
+                substituido_na_importacao_id INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS backup_documentos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                importacao_id INTEGER NOT NULL,
+                documento_id_original INTEGER,
+                placa TEXT NOT NULL,
+                documento TEXT NOT NULL,
+                vencimento TEXT NOT NULL,
+                composicao TEXT NOT NULL,
+                placa_cavalo TEXT,
+                placa_carreta_1 TEXT,
+                placa_carreta_2 TEXT,
+                equipamento TEXT,
+                origem TEXT,
+                importado_em TEXT,
+                importado_por TEXT,
+                importacao_original_id INTEGER,
+                backup_em TEXT NOT NULL,
+                FOREIGN KEY (importacao_id) REFERENCES importacoes(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_documentos_vencimento
+                ON documentos(vencimento);
+            CREATE INDEX IF NOT EXISTS idx_historico_placa_documento
+                ON historico_documentos(placa, documento);
+            CREATE INDEX IF NOT EXISTS idx_backup_importacao
+                ON backup_documentos(importacao_id);
+            """
         )
 
-    def item_curto(row):
-        return f"{row['Equipamento']} {row['Placa']} - {row['Documento']}"
 
-    detalhe_filtrado["Item"] = detalhe_filtrado.apply(item_longo, axis=1)
-    detalhe_filtrado["Item curto"] = detalhe_filtrado.apply(item_curto, axis=1)
+def salvar_importacao(
+    registros: list[dict], usuario: str, arquivo_base: str, arquivo_documentos: str
+) -> dict:
+    momento = agora_local().isoformat(timespec="seconds")
+    usuario = usuario.strip()
+    estatisticas = {
+        "recebidos": len(registros),
+        "inseridos": 0,
+        "atualizados": 0,
+        "ignorados": 0,
+    }
 
-    itens_por_comp = (
-        detalhe_filtrado.groupby("Composição")["Item"]
-        .apply(lambda s: "\n".join(s.tolist()))
-        .reset_index(name="Documentos no filtro")
+    # Dentro da planilha importada, placa + documento repetidos ficam com o
+    # maior vencimento. Duplicatas exatas também são eliminadas aqui.
+    consolidados: dict[tuple[str, str], dict] = {}
+    for registro in registros:
+        chave = (registro["placa"], registro["documento"])
+        anterior = consolidados.get(chave)
+        if anterior is None or registro["vencimento"] > anterior["vencimento"]:
+            consolidados[chave] = registro
+
+    with conectar() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO importacoes
+                (data_hora, usuario, arquivo_base, arquivo_documentos, total_recebidos)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (momento, usuario, arquivo_base, arquivo_documentos, len(registros)),
+        )
+        importacao_id = int(cursor.lastrowid)
+
+        # Snapshot completo imediatamente anterior a esta importação.
+        conn.execute(
+            """
+            INSERT INTO backup_documentos (
+                importacao_id, documento_id_original, placa, documento, vencimento,
+                composicao, placa_cavalo, placa_carreta_1, placa_carreta_2,
+                equipamento, origem, importado_em, importado_por,
+                importacao_original_id, backup_em
+            )
+            SELECT ?, id, placa, documento, vencimento, composicao, placa_cavalo,
+                   placa_carreta_1, placa_carreta_2, equipamento, origem,
+                   importado_em, importado_por, importacao_id, ?
+            FROM documentos
+            """,
+            (importacao_id, momento),
+        )
+
+        for registro in consolidados.values():
+            existente = conn.execute(
+                "SELECT * FROM documentos WHERE placa = ? AND documento = ?",
+                (registro["placa"], registro["documento"]),
+            ).fetchone()
+
+            if existente is None:
+                conn.execute(
+                    """
+                    INSERT INTO documentos (
+                        placa, documento, vencimento, composicao, placa_cavalo,
+                        placa_carreta_1, placa_carreta_2, equipamento, origem,
+                        importado_em, importado_por, importacao_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        registro["placa"], registro["documento"], registro["vencimento"],
+                        registro["composicao"], registro["placa_cavalo"],
+                        registro["placa_carreta_1"], registro["placa_carreta_2"],
+                        registro["equipamento"], registro["origem"], momento,
+                        usuario, importacao_id,
+                    ),
+                )
+                estatisticas["inseridos"] += 1
+                continue
+
+            if registro["vencimento"] <= existente["vencimento"]:
+                estatisticas["ignorados"] += 1
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO historico_documentos (
+                    documento_id_original, placa, documento, vencimento, composicao,
+                    placa_cavalo, placa_carreta_1, placa_carreta_2, equipamento,
+                    origem, importado_em, importado_por, importacao_original_id,
+                    substituido_em, substituido_por, substituido_na_importacao_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    existente["id"], existente["placa"], existente["documento"],
+                    existente["vencimento"], existente["composicao"],
+                    existente["placa_cavalo"], existente["placa_carreta_1"],
+                    existente["placa_carreta_2"], existente["equipamento"],
+                    existente["origem"], existente["importado_em"],
+                    existente["importado_por"], existente["importacao_id"],
+                    momento, usuario, importacao_id,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE documentos SET
+                    vencimento = ?, composicao = ?, placa_cavalo = ?,
+                    placa_carreta_1 = ?, placa_carreta_2 = ?, equipamento = ?,
+                    origem = ?, importado_em = ?, importado_por = ?, importacao_id = ?
+                WHERE id = ?
+                """,
+                (
+                    registro["vencimento"], registro["composicao"],
+                    registro["placa_cavalo"], registro["placa_carreta_1"],
+                    registro["placa_carreta_2"], registro["equipamento"],
+                    registro["origem"], momento, usuario, importacao_id,
+                    existente["id"],
+                ),
+            )
+            estatisticas["atualizados"] += 1
+
+        estatisticas["ignorados"] += len(registros) - len(consolidados)
+        conn.execute(
+            """
+            UPDATE importacoes
+            SET inseridos = ?, atualizados = ?, ignorados = ?
+            WHERE id = ?
+            """,
+            (
+                estatisticas["inseridos"], estatisticas["atualizados"],
+                estatisticas["ignorados"], importacao_id,
+            ),
+        )
+        estatisticas["importacao_id"] = importacao_id
+    return estatisticas
+
+
+def consultar_sql(sql: str, parametros: tuple = ()) -> pd.DataFrame:
+    with conectar() as conn:
+        return pd.read_sql_query(sql, conn, params=parametros)
+
+
+def carregar_documentos() -> pd.DataFrame:
+    df = consultar_sql(
+        """
+        SELECT placa, documento, vencimento, composicao, placa_cavalo,
+               placa_carreta_1, placa_carreta_2, equipamento, origem,
+               importado_em, importado_por, importacao_id
+        FROM documentos
+        """
+    )
+    if not df.empty:
+        df["vencimento"] = pd.to_datetime(df["vencimento"], errors="coerce")
+    return df
+
+
+def carregar_importacoes() -> pd.DataFrame:
+    return consultar_sql(
+        """
+        SELECT id AS importacao_id, data_hora, usuario, arquivo_base,
+               arquivo_documentos, total_recebidos, inseridos, atualizados, ignorados
+        FROM importacoes ORDER BY id DESC LIMIT 100
+        """
     )
 
-    comp = df_base[df_base["Composição"].isin(itens_por_comp["Composição"])].copy()
-    comp = comp.drop(columns=["Documentos no filtro"], errors="ignore").merge(itens_por_comp, on="Composição", how="left")
 
-    def status_descritivo(grupo: pd.DataFrame) -> str:
-        status = sorted(grupo["Status"].unique(), key=status_prioridade)[0]
-        docs_status = grupo[grupo["Status"] == status].sort_values("Vencimento")
-        labels = docs_status["Item curto"].tolist()
-        texto = "; ".join(labels[:2])
-        if len(labels) > 2:
-            texto += f"; +{len(labels) - 2} doc."
-        return f"{status}: {texto}" if texto else status
+def carregar_historico() -> pd.DataFrame:
+    df = consultar_sql(
+        """
+        SELECT placa, documento, vencimento, composicao, equipamento, origem,
+               importado_em, importado_por, substituido_em, substituido_por,
+               substituido_na_importacao_id
+        FROM historico_documentos
+        ORDER BY id DESC
+        """
+    )
+    return df
 
-    status_minimo = detalhe_filtrado.groupby("Composição").apply(status_descritivo)
-    doc_alerta = detalhe_filtrado.sort_values("Vencimento").groupby("Composição")["Item curto"].first()
-    vencimento_filtro = detalhe_filtrado.groupby("Composição")["Vencimento"].min()
-    dias_filtro = detalhe_filtrado.groupby("Composição")["Dias p/ vencer"].min()
 
-    comp["Status geral"] = comp["Composição"].map(status_minimo).fillna(comp["Status geral"])
-    comp["Documento em alerta"] = comp["Composição"].map(doc_alerta).fillna(comp.get("Documento em alerta", ""))
-    # No recorte filtrado, o vencimento/dias exibidos representam o documento mais próximo dentro daquele filtro.
-    comp["Vencimento em alerta"] = comp["Composição"].map(vencimento_filtro).fillna(comp.get("Vencimento em alerta", pd.NaT))
-    comp["Dias alerta"] = comp["Composição"].map(dias_filtro).fillna(comp.get("Dias alerta", ""))
-    comp["Vencimento mais próximo"] = comp["Vencimento em alerta"]
-    comp["Dias p/ vencer"] = comp["Dias alerta"]
-
-    comp["_ordem_status"] = comp["Status geral"].map(status_prioridade)
-    comp = comp.sort_values(["_ordem_status", "Vencimento em alerta", "Composição"]).drop(columns=["_ordem_status"])
-    return comp[COLUNAS_VISUAIS]
+def carregar_ultimo_backup() -> tuple[pd.DataFrame, int | None]:
+    ultima = consultar_sql("SELECT MAX(importacao_id) AS id FROM backup_documentos")
+    if ultima.empty or pd.isna(ultima.iloc[0]["id"]):
+        return pd.DataFrame(), None
+    importacao_id = int(ultima.iloc[0]["id"])
+    df = consultar_sql(
+        """
+        SELECT placa, documento, vencimento, composicao, equipamento, origem,
+               importado_em, importado_por, backup_em
+        FROM backup_documentos
+        WHERE importacao_id = ? ORDER BY composicao, placa, documento
+        """,
+        (importacao_id,),
+    )
+    return df, importacao_id
 
 
 # =========================================================
-# FILTROS DA INTERFACE
+# LEITURA E CONSOLIDAÇÃO DAS PLANILHAS
 # =========================================================
-def aplicar_filtros(df: pd.DataFrame, filtro_placa: str, filtro_documentos: list[str], filtro_equipamentos: list[str], status_opcoes: list[str] | None = None) -> pd.DataFrame:
+def localizar_linha_cabecalho_documentos(df_bruto: pd.DataFrame) -> int:
+    for indice in range(min(30, len(df_bruto))):
+        linha = [normalizar_texto(x) for x in df_bruto.iloc[indice].tolist()]
+        tem_placa = any(c == "PLACA" or c.startswith("PLACA ") for c in linha)
+        tem_documento = any(
+            c in {"LAUDO", "DOCUMENTO", "TIPO DE DOCUMENTO", "TIPO LAUDO"}
+            or "LAUDO" in c
+            for c in linha
+        )
+        tem_vencimento = any("VENC" in c or "VALIDADE" in c for c in linha)
+        if tem_placa and tem_documento and tem_vencimento:
+            return indice
+    raise ValueError(
+        "Não localizei um cabeçalho com Placa, Documento/Laudo e Vencimento."
+    )
+
+
+def ler_planilha_documentos(arquivo, aba: str) -> pd.DataFrame:
+    arquivo.seek(0)
+    bruto = pd.read_excel(arquivo, sheet_name=aba, header=None, dtype=object)
+    linha_cabecalho = localizar_linha_cabecalho_documentos(bruto)
+    df = bruto.iloc[linha_cabecalho + 1 :].copy()
+    df.columns = criar_nomes_unicos(bruto.iloc[linha_cabecalho].tolist())
+    return df.dropna(how="all")
+
+
+def ler_base(arquivo, aba: str) -> pd.DataFrame:
+    arquivo.seek(0)
+    return pd.read_excel(arquivo, sheet_name=aba, dtype=object).dropna(how="all")
+
+
+def localizar_coluna(colunas, candidatos: list[str], contem: list[str] | None = None):
+    normalizadas = {coluna: normalizar_texto(coluna) for coluna in colunas}
+    for candidato in candidatos:
+        alvo = normalizar_texto(candidato)
+        for original, normalizada in normalizadas.items():
+            if normalizada == alvo:
+                return original
+    if contem:
+        termos = [normalizar_texto(x) for x in contem]
+        for original, normalizada in normalizadas.items():
+            if all(termo in normalizada for termo in termos):
+                return original
+    return None
+
+
+def extrair_documentos_origem(df: pd.DataFrame) -> list[dict]:
+    col_placa = localizar_coluna(df.columns, ["PLACA"], contem=["PLACA"])
+    col_tipo = localizar_coluna(
+        df.columns,
+        ["LAUDO", "DOCUMENTO", "TIPO DE DOCUMENTO", "TIPO LAUDO"],
+        contem=["LAUDO"],
+    )
+    col_vencimento = localizar_coluna(
+        df.columns,
+        ["DATA VENCIMENTO", "VENCIMENTO", "DATA DE VENCIMENTO", "VALIDADE"],
+        contem=["VENC"],
+    )
+    if col_vencimento is None:
+        col_vencimento = localizar_coluna(df.columns, [], contem=["VALIDADE"])
+    if col_placa is None or col_tipo is None or col_vencimento is None:
+        raise ValueError("A planilha de documentos não possui as colunas obrigatórias.")
+
+    registros = []
+    for _, row in df.iterrows():
+        placa = limpar_placa(row.get(col_placa))
+        documento = classificar_documento(row.get(col_tipo))
+        vencimento = data_iso(row.get(col_vencimento))
+        if placa and documento and vencimento:
+            registros.append(
+                {
+                    "placa": placa,
+                    "documento": documento,
+                    "vencimento": vencimento,
+                    "origem": "PLANILHA DE DOCUMENTOS",
+                }
+            )
+    return registros
+
+
+def nome_coluna_para_documento(coluna) -> str | None:
+    return classificar_documento(coluna)
+
+
+def extrair_composicoes_e_fallbacks(df_base: pd.DataFrame) -> tuple[dict, list[dict]]:
+    mapa_placas: dict[str, dict] = {}
+    fallbacks: list[dict] = []
+
+    # Compatibilidade com a estrutura original:
+    # 0 cavalo | 1 CIV cavalo | 2 cronotacógrafo | 3 carreta 1 |
+    # 4 carreta 2 | 5 CIV carretas | 6 CIPP carretas | 7 aferição carretas.
+    for _, row in df_base.iterrows():
+        cavalo = limpar_placa(valor_posicional(row, 0))
+        carreta_1 = limpar_placa(valor_posicional(row, 3))
+        carreta_2 = limpar_placa(valor_posicional(row, 4))
+        placas = [placa for placa in [cavalo, carreta_1, carreta_2] if placa]
+        if not placas:
+            continue
+        composicao = " + ".join(placas)
+        dados_composicao = {
+            "composicao": composicao,
+            "placa_cavalo": cavalo,
+            "placa_carreta_1": carreta_1,
+            "placa_carreta_2": carreta_2,
+        }
+        for placa, equipamento in [
+            (cavalo, "Cavalo"),
+            (carreta_1, "Carreta 1"),
+            (carreta_2, "Carreta 2"),
+        ]:
+            if placa:
+                mapa_placas[placa] = {**dados_composicao, "equipamento": equipamento}
+
+        candidatos = [
+            (cavalo, "CIV", valor_posicional(row, 1), "Cavalo"),
+            (cavalo, "CRONOTACÓGRAFO", valor_posicional(row, 2), "Cavalo"),
+            (carreta_1, "CIV", valor_posicional(row, 5), "Carreta 1"),
+            (carreta_2, "CIV", valor_posicional(row, 5), "Carreta 2"),
+            (carreta_1, "CIPP", valor_posicional(row, 6), "Carreta 1"),
+            (carreta_2, "CIPP", valor_posicional(row, 6), "Carreta 2"),
+            (carreta_1, "AFERIÇÃO", valor_posicional(row, 7), "Carreta 1"),
+            (carreta_2, "AFERIÇÃO", valor_posicional(row, 7), "Carreta 2"),
+        ]
+        for placa, documento, vencimento, equipamento in candidatos:
+            vencimento_iso = data_iso(vencimento)
+            if placa and vencimento_iso:
+                fallbacks.append(
+                    {
+                        "placa": placa,
+                        "documento": documento,
+                        "vencimento": vencimento_iso,
+                        **dados_composicao,
+                        "equipamento": equipamento,
+                        "origem": "BASE DE COMPOSIÇÕES",
+                    }
+                )
+
+        # Colunas nomeadas permitem trazer IBAMA, CR IBAMA e CRLV da base,
+        # quando o nome da coluna também identifica o equipamento.
+        for coluna in df_base.columns:
+            documento = nome_coluna_para_documento(coluna)
+            if documento not in {"IBAMA", "CR IBAMA", "CRLV"}:
+                continue
+            nome = normalizar_texto(coluna)
+            destinos = []
+            if "CAVALO" in nome:
+                destinos = [(cavalo, "Cavalo")]
+            elif "CARRETA 1" in nome:
+                destinos = [(carreta_1, "Carreta 1")]
+            elif "CARRETA 2" in nome:
+                destinos = [(carreta_2, "Carreta 2")]
+            for placa, equipamento in destinos:
+                vencimento_iso = data_iso(row.get(coluna))
+                if placa and vencimento_iso:
+                    fallbacks.append(
+                        {
+                            "placa": placa,
+                            "documento": documento,
+                            "vencimento": vencimento_iso,
+                            **dados_composicao,
+                            "equipamento": equipamento,
+                            "origem": "BASE DE COMPOSIÇÕES",
+                        }
+                    )
+    return mapa_placas, fallbacks
+
+
+def preparar_registros_importacao(
+    df_base: pd.DataFrame, df_documentos: pd.DataFrame
+) -> list[dict]:
+    mapa_placas, fallbacks = extrair_composicoes_e_fallbacks(df_base)
+    documentos_origem = extrair_documentos_origem(df_documentos)
+    registros = list(fallbacks)
+
+    for item in documentos_origem:
+        vinculo = mapa_placas.get(item["placa"])
+        if vinculo:
+            registros.append({**item, **vinculo})
+        else:
+            registros.append(
+                {
+                    **item,
+                    "composicao": item["placa"],
+                    "placa_cavalo": "",
+                    "placa_carreta_1": "",
+                    "placa_carreta_2": "",
+                    "equipamento": "Não vinculado",
+                }
+            )
+    return registros
+
+
+# =========================================================
+# FILTROS E PAINÉIS
+# =========================================================
+def enriquecer_status(df: pd.DataFrame, data_referencia: date) -> pd.DataFrame:
     if df.empty:
-        return df
-
+        return df.copy()
     resultado = df.copy()
+    resultado["Status"] = resultado["vencimento"].apply(
+        lambda valor: status_vencimento(valor, data_referencia)
+    )
+    ref = pd.Timestamp(data_referencia).normalize()
+    resultado["Dias"] = (resultado["vencimento"] - ref).dt.days
+    resultado["_ordem_status"] = resultado["Status"].map(STATUS_ORDEM).fillna(99)
+    return resultado.sort_values(
+        ["_ordem_status", "vencimento", "composicao", "documento"]
+    ).drop(columns="_ordem_status")
 
-    if status_opcoes and "Todos" not in status_opcoes:
-        col_status = "Status" if "Status" in resultado.columns else "Status geral"
-        resultado = resultado[resultado[col_status].isin(status_opcoes)]
 
-    if filtro_placa:
-        placa = limpar_placa(filtro_placa)
-        colunas_placa = [c for c in ["Placa", "Placa Cavalo", "Placa Carreta 1", "Placa Carreta 2", "Composição"] if c in resultado.columns]
-        mask = pd.Series(False, index=resultado.index)
-        for col in colunas_placa:
-            mask = mask | resultado[col].astype(str).str.replace("-", "", regex=False).str.upper().str.contains(placa, na=False)
-        resultado = resultado[mask]
+def aplicar_filtros(
+    df: pd.DataFrame,
+    placa: str,
+    data_inicio: date | None,
+    data_fim: date | None,
+    documentos: list[str],
+    filtro_card: str,
+) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    resultado = df.copy()
+    placa_limpa = limpar_placa(placa)
+    if placa_limpa:
+        resultado = resultado[
+            resultado["placa"].str.contains(placa_limpa, na=False)
+            | resultado["composicao"].str.replace(" ", "", regex=False).str.contains(
+                placa_limpa, na=False
+            )
+        ]
+    if data_inicio:
+        resultado = resultado["vencimento"].ge(pd.Timestamp(data_inicio))
+    if data_fim:
+        resultado = resultado["vencimento"].le(pd.Timestamp(data_fim))
+    if documentos:
+        resultado = resultado[resultado["documento"].isin(documentos)]
 
-    if filtro_documentos and "Todos" not in filtro_documentos and "Documento" in resultado.columns:
-        resultado = resultado[resultado["Documento"].isin(filtro_documentos)]
-
-    if filtro_equipamentos and "Todos" not in filtro_equipamentos and "Equipamento" in resultado.columns:
-        resultado = resultado[resultado["Equipamento"].isin(filtro_equipamentos)]
-
+    filtros_card = {
+        "VENCIDOS": ["VENCIDO"],
+        "HOJE": ["VENCE HOJE"],
+        "SEMANA": ["VENCE HOJE", "VENCE NA SEMANA"],
+        "MÊS": ["VENCE NO MÊS"],
+        "OK": ["OK"],
+    }
+    if filtro_card in filtros_card:
+        resultado = resultado[resultado["Status"].isin(filtros_card[filtro_card])]
     return resultado
 
 
-def aplicar_filtros_composicao(df_comp: pd.DataFrame, df_detalhe_filtrado: pd.DataFrame) -> pd.DataFrame:
-    if df_comp.empty:
-        return df_comp
-    if df_detalhe_filtrado.empty:
-        return df_comp.iloc[0:0].copy()
-
-    comps = df_detalhe_filtrado["Composição"].dropna().unique().tolist()
-    return df_comp[df_comp["Composição"].isin(comps)].copy()
-
-
-def dataframe_datas(df: pd.DataFrame) -> pd.DataFrame:
-    """Mantém somente identificação da composição, placas, status e datas."""
+def resumir_composicoes(df: pd.DataFrame) -> pd.DataFrame:
+    colunas = [
+        "Placas da composição",
+        "Placa do documento",
+        "Documento/Laudo",
+        "Data de vencimento",
+    ]
     if df.empty:
-        return df
-    colunas = [c for c in COLUNAS_VISUAIS if c in df.columns]
-    return df[colunas].copy()
+        return pd.DataFrame(columns=colunas)
 
+    def juntar_unicos(serie) -> str:
+        return "\n".join(dict.fromkeys(str(x) for x in serie if str(x).strip()))
 
-def configurar_colunas_datas(df: pd.DataFrame):
-    config = {}
-    for col in df.columns:
-        if "Vencimento" in col or col in DOCUMENTOS_COMPOSICAO:
-            config[col] = st.column_config.DateColumn(col, format="DD/MM/YYYY")
-    return config
-
-
-# =========================================================
-# EXPORTAÇÃO EXCEL
-# =========================================================
-def preparar_para_excel(df: pd.DataFrame) -> pd.DataFrame:
-    saida = df.copy()
-    for col in saida.columns:
-        if pd.api.types.is_datetime64_any_dtype(saida[col]):
-            saida[col] = saida[col].dt.strftime("%d/%m/%Y")
-    return saida
-
-
-def exportar_excel(relatorios: dict, data_referencia: date, df_filtrado_detalhe: pd.DataFrame | None = None, df_filtrado_comp: pd.DataFrame | None = None) -> bytes:
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        resumo = pd.DataFrame(
-            [
-                ["Data de referência", pd.Timestamp(data_referencia).strftime("%d/%m/%Y")],
-                ["Semana analisada", f"{relatorios['inicio_semana'].strftime('%d/%m/%Y')} a {relatorios['fim_semana'].strftime('%d/%m/%Y')}"],
-                ["Mês analisado", f"{relatorios['inicio_mes'].strftime('%d/%m/%Y')} a {relatorios['fim_mes'].strftime('%d/%m/%Y')}"],
-                ["Composições na base", len(relatorios["base_atualizada"])],
-                ["Documentos analisados", len(relatorios["detalhe_documentos"])],
-                ["Composições com documentos vencidos", len(relatorios["vencidos"])],
-                ["Composições com documentos vencendo hoje", len(relatorios["vencem_hoje"])],
-                ["Composições com documentos vencendo no restante da semana", len(relatorios["vencem_semana"])],
-                ["Composições com documentos vencendo no mês", len(relatorios["vencem_mes"])],
-                ["Regra", "KMM atualiza por Placa + Tipo de Laudo. A composição permanece em uma única linha."],
-            ],
-            columns=["Indicador", "Valor"],
+    temporario = df.copy()
+    temporario["vencimento_formatado"] = temporario["vencimento"].dt.strftime("%d/%m/%Y")
+    resumo = (
+        temporario.groupby("composicao", sort=False)
+        .agg(
+            **{
+                "Placa do documento": ("placa", juntar_unicos),
+                "Documento/Laudo": ("documento", juntar_unicos),
+                "Data de vencimento": ("vencimento_formatado", juntar_unicos),
+            }
         )
+        .reset_index()
+        .rename(columns={"composicao": "Placas da composição"})
+    )
+    return resumo[colunas]
 
-        abas = {
-            "RESUMO": resumo,
-            "VENCIDOS": preparar_para_excel(relatorios["vencidos"]),
-            "VENCE_HOJE": preparar_para_excel(relatorios["vencem_hoje"]),
-            "VENCEM_SEMANA": preparar_para_excel(relatorios["vencem_semana"]),
-            "VENCEM_MES": preparar_para_excel(relatorios["vencem_mes"]),
-            "BASE_DATAS": preparar_para_excel(dataframe_datas(relatorios["base_atualizada"])),
-            "DETALHE_DOCUMENTOS": preparar_para_excel(relatorios["detalhe_documentos"]),
+
+def preparar_detalhe(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Status", "Composição", "Equipamento", "Placa", "Documento/Laudo",
+                "Vencimento", "Dias", "Origem", "Atualizado por", "Atualizado em",
+            ]
+        )
+    saida = df.copy()
+    saida["vencimento"] = saida["vencimento"].dt.strftime("%d/%m/%Y")
+    saida["importado_em"] = pd.to_datetime(
+        saida["importado_em"], errors="coerce"
+    ).dt.strftime("%d/%m/%Y %H:%M:%S")
+    saida = saida.rename(
+        columns={
+            "composicao": "Composição",
+            "equipamento": "Equipamento",
+            "placa": "Placa",
+            "documento": "Documento/Laudo",
+            "vencimento": "Vencimento",
+            "origem": "Origem",
+            "importado_por": "Atualizado por",
+            "importado_em": "Atualizado em",
         }
-        if df_filtrado_comp is not None:
-            abas["COMPOSICOES_FILTRADAS"] = preparar_para_excel(dataframe_datas(df_filtrado_comp))
-        if df_filtrado_detalhe is not None:
-            abas["DETALHE_FILTRADO"] = preparar_para_excel(df_filtrado_detalhe)
+    )
+    colunas = [
+        "Status", "Composição", "Equipamento", "Placa", "Documento/Laudo",
+        "Vencimento", "Dias", "Origem", "Atualizado por", "Atualizado em",
+    ]
+    return saida[colunas]
 
-        for nome_aba, df in abas.items():
-            df.to_excel(writer, sheet_name=nome_aba, index=False)
 
+def painel_status(
+    titulo: str, df: pd.DataFrame, status: list[str], mensagem_vazia: str
+) -> None:
+    st.subheader(titulo)
+    dados = df[df["Status"].isin(status)] if not df.empty else df
+    if dados.empty:
+        st.success(mensagem_vazia)
+        return
+    st.dataframe(
+        estilizar_tabela(resumir_composicoes(dados)),
+        use_container_width=True,
+        hide_index=True,
+        height=min(460, 75 + len(resumir_composicoes(dados)) * 36),
+    )
+
+
+def estilizar_tabela(df: pd.DataFrame):
+    return df.style.set_table_styles(
+        [
+            {
+                "selector": "th",
+                "props": [
+                    ("background-color", COR_CABECALHO),
+                    ("color", COR_TEXTO),
+                    ("font-weight", "700"),
+                ],
+            },
+            {"selector": "td", "props": [("color", COR_TEXTO)]},
+        ]
+    )
+
+
+def gerar_excel(
+    documentos_filtrados: pd.DataFrame,
+    historico: pd.DataFrame,
+    importacoes: pd.DataFrame,
+) -> bytes:
+    output = BytesIO()
+    detalhe = preparar_detalhe(documentos_filtrados)
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        detalhe.to_excel(writer, sheet_name="DOCUMENTOS", index=False)
+        resumir_composicoes(documentos_filtrados).to_excel(
+            writer, sheet_name="COMPOSICOES", index=False
+        )
+        historico.to_excel(writer, sheet_name="HISTORICO", index=False)
+        importacoes.to_excel(writer, sheet_name="IMPORTACOES", index=False)
         workbook = writer.book
-        header_fmt = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#17365D", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
-        text_fmt = workbook.add_format({"border": 1, "valign": "top", "text_wrap": True})
-        int_fmt = workbook.add_format({"border": 1, "num_format": "0"})
-
-        for sheet_name, df in abas.items():
-            ws = writer.sheets[sheet_name]
+        formato_cabecalho = workbook.add_format(
+            {
+                "bold": True,
+                "bg_color": COR_CABECALHO,
+                "font_color": COR_TEXTO,
+                "border": 1,
+                "align": "center",
+                "valign": "vcenter",
+            }
+        )
+        formato_texto = workbook.add_format(
+            {"font_color": COR_TEXTO, "border": 1, "valign": "top", "text_wrap": True}
+        )
+        for nome_aba, planilha in {
+            "DOCUMENTOS": detalhe,
+            "COMPOSICOES": resumir_composicoes(documentos_filtrados),
+            "HISTORICO": historico,
+            "IMPORTACOES": importacoes,
+        }.items():
+            ws = writer.sheets[nome_aba]
             ws.freeze_panes(1, 0)
-            for col_num, col_name in enumerate(df.columns):
-                ws.write(0, col_num, col_name, header_fmt)
-                largura = min(max(len(str(col_name)) + 3, 14), 32)
-                if col_name in ["Composição", "Documentos no filtro", "Regra", "Valor"]:
-                    largura = 42
-                if col_name == "Documentos no filtro":
-                    largura = 56
-                ws.set_column(col_num, col_num, largura, text_fmt)
-                if "Dias" in str(col_name):
-                    ws.set_column(col_num, col_num, 12, int_fmt)
-            if len(df) > 0 and len(df.columns) > 0:
-                ws.autofilter(0, 0, len(df), len(df.columns) - 1)
-
+            for indice, coluna in enumerate(planilha.columns):
+                ws.write(0, indice, coluna, formato_cabecalho)
+                largura = min(max(len(str(coluna)) + 4, 15), 38)
+                ws.set_column(indice, indice, largura, formato_texto)
+            if len(planilha) and len(planilha.columns):
+                ws.autofilter(0, 0, len(planilha), len(planilha.columns) - 1)
     return output.getvalue()
 
 
-
 # =========================================================
-# INTERFACE ONLINE - STREAMLIT V3
+# INTERFACE
 # =========================================================
-st.set_page_config(page_title="Painel de Vencimentos", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(
+    page_title="Painel de Vencimentos",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 st.markdown(
-    """
+    f"""
     <style>
-        .block-container {
-            padding-top: 1.4rem;
-            padding-bottom: 1.5rem;
-            max-width: 1500px;
-        }
-        .main-title {
-            font-size: 34px;
-            font-weight: 800;
-            color: #17365D;
-            line-height: 1.1;
-            margin-bottom: 2px;
-        }
-        .subtitle {
-            color: #667085;
-            font-size: 15px;
-            margin-bottom: 16px;
-        }
-        .section-card {
-            border: 1px solid #E6EAF0;
-            border-radius: 18px;
-            padding: 18px 18px 8px 18px;
-            background: #FFFFFF;
-            box-shadow: 0 4px 16px rgba(16, 24, 40, 0.05);
-            margin-bottom: 14px;
-        }
-        .metric-card {
-            border-radius: 18px;
-            padding: 16px 16px 14px 16px;
-            border: 1px solid #EAECF0;
-            background: linear-gradient(180deg, #FFFFFF 0%, #F9FAFB 100%);
-            box-shadow: 0 4px 14px rgba(16, 24, 40, 0.06);
-            min-height: 105px;
-        }
-        .metric-label {
-            font-size: 13px;
-            font-weight: 700;
-            color: #667085;
-            text-transform: uppercase;
-            letter-spacing: .03em;
-            margin-bottom: 7px;
-        }
-        .metric-value {
-            font-size: 31px;
-            font-weight: 850;
-            color: #101828;
-            line-height: 1.05;
-        }
-        .metric-note {
-            font-size: 12px;
-            color: #667085;
-            margin-top: 7px;
-        }
-        .danger { border-left: 6px solid #B42318; }
-        .warning { border-left: 6px solid #DC6803; }
-        .month { border-left: 6px solid #2E90FA; }
-        .neutral { border-left: 6px solid #475467; }
-        .ok { border-left: 6px solid #039855; }
-        .small-caption {
-            color: #667085;
-            font-size: 13px;
-            margin-top: -4px;
-            margin-bottom: 6px;
-        }
-        div[data-testid="stDataFrame"] {
-            border: 1px solid #EAECF0;
-            border-radius: 14px;
-            overflow: hidden;
-        }
-        .stDownloadButton > button {
-            border-radius: 12px;
-            font-weight: 700;
-            border: 1px solid #17365D;
-        }
+    :root {{ --cabecalho: {COR_CABECALHO}; --texto: {COR_TEXTO}; }}
+    .stApp {{ color: var(--texto); }}
+    .block-container {{ padding-top: 1.2rem; max-width: 1550px; }}
+    h1, h2, h3, label, p {{ color: var(--texto); }}
+    .titulo {{ font-size: 2.15rem; font-weight: 850; color: var(--texto); }}
+    .subtitulo {{ color: #4B536F; margin: 0.1rem 0 1rem; }}
+    .faixa {{ background: var(--cabecalho); color: var(--texto); padding: .75rem 1rem;
+              border-radius: 12px; font-weight: 800; margin: .7rem 0; }}
+    div[data-testid="stButton"] > button {{
+        width: 100%; min-height: 92px; border-radius: 15px;
+        border: 1px solid var(--cabecalho); background: #FFFDF5;
+        color: var(--texto); font-weight: 800; font-size: 1rem;
+        white-space: pre-line;
+    }}
+    div[data-testid="stButton"] > button:hover {{
+        background: var(--cabecalho); color: var(--texto); border-color: var(--cabecalho);
+    }}
+    div[data-testid="stDataFrame"] {{ border: 1px solid #D8C98D; border-radius: 12px; }}
+    .stDownloadButton > button {{
+        border-color: var(--cabecalho); color: var(--texto); font-weight: 750;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-def metric_card(label: str, value, note: str = "", css_class: str = "neutral"):
+def main() -> None:
+    inicializar_banco()
     st.markdown(
-        f"""
-        <div class="metric-card {css_class}">
-            <div class="metric-label">{label}</div>
-            <div class="metric-value">{value}</div>
-            <div class="metric-note">{note}</div>
-        </div>
-        """,
+        '<div class="titulo">Painel de vencimentos por composição</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="subtitulo">Banco persistente, histórico de alterações e '
+        'composições mantidas em uma única linha lógica.</div>',
         unsafe_allow_html=True,
     )
 
+    with st.expander("Importar e atualizar o banco de dados", expanded=False):
+        col_usuario, col_base, col_documentos = st.columns([0.7, 1.15, 1.15])
+        with col_usuario:
+            usuario = st.text_input(
+                "Usuário responsável *", placeholder="Nome do usuário"
+            )
+        with col_base:
+            arquivo_base = st.file_uploader(
+                "Base de composições", type=["xlsx", "xls"], key="base"
+            )
+        with col_documentos:
+            arquivo_documentos = st.file_uploader(
+                "Laudos/documentos", type=["xlsx", "xls"], key="documentos"
+            )
 
-def formatar_periodo(relatorios: dict, data_ref: date) -> str:
-    return (
-        f"Referência: {pd.Timestamp(data_ref).strftime('%d/%m/%Y')} &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"Semana: {relatorios['inicio_semana'].strftime('%d/%m/%Y')} a {relatorios['fim_semana'].strftime('%d/%m/%Y')} &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"Mês: {relatorios['inicio_mes'].strftime('%d/%m/%Y')} a {relatorios['fim_mes'].strftime('%d/%m/%Y')}"
-    )
+        aba_base = aba_documentos = None
+        if arquivo_base:
+            arquivo_base.seek(0)
+            abas_base = pd.ExcelFile(arquivo_base).sheet_names
+        else:
+            abas_base = []
+        if arquivo_documentos:
+            arquivo_documentos.seek(0)
+            abas_documentos = pd.ExcelFile(arquivo_documentos).sheet_names
+        else:
+            abas_documentos = []
+        if abas_base and abas_documentos:
+            c1, c2 = st.columns(2)
+            with c1:
+                aba_base = st.selectbox("Aba da base", abas_base)
+            with c2:
+                aba_documentos = st.selectbox("Aba dos documentos", abas_documentos)
 
+        if st.button("Importar e atualizar banco", key="executar_importacao"):
+            if not usuario.strip():
+                st.error("Informe o usuário responsável pela importação.")
+            elif not arquivo_base or not arquivo_documentos:
+                st.error("Envie a base de composições e a planilha de documentos.")
+            else:
+                try:
+                    with st.spinner("Validando, criando backup e atualizando o banco..."):
+                        df_base = ler_base(arquivo_base, aba_base)
+                        df_documentos = ler_planilha_documentos(
+                            arquivo_documentos, aba_documentos
+                        )
+                        registros = preparar_registros_importacao(df_base, df_documentos)
+                        if not registros:
+                            raise ValueError("Nenhum documento válido foi encontrado.")
+                        resultado = salvar_importacao(
+                            registros,
+                            usuario,
+                            arquivo_base.name,
+                            arquivo_documentos.name,
+                        )
+                    st.success(
+                        f"Importação {resultado['importacao_id']} concluída: "
+                        f"{resultado['inseridos']} inseridos, "
+                        f"{resultado['atualizados']} atualizados e "
+                        f"{resultado['ignorados']} duplicados/mais antigos ignorados."
+                    )
+                except Exception as erro:
+                    st.error(f"Não foi possível importar: {erro}")
 
-def montar_resumo_status(df_detalhe: pd.DataFrame) -> pd.DataFrame:
-    if df_detalhe.empty:
-        return pd.DataFrame(columns=["Status", "Composições", "Documentos", "Vencimento mais próximo"])
+    documentos_banco = carregar_documentos()
+    if documentos_banco.empty:
+        st.info("O banco ainda está vazio. Faça a primeira importação acima.")
+        return
 
-    ordem_status = ["VENCIDO", "VENCE HOJE", "VENCE NA SEMANA", "VENCE NO MÊS", "OK", "SEM DATA"]
-    resumo = (
-        df_detalhe.groupby("Status")
-        .agg(
-            Composições=("Composição", "nunique"),
-            Documentos=("Documento", "count"),
-            **{"Vencimento mais próximo": ("Vencimento", "min")},
+    st.markdown('<div class="faixa">Filtros principais</div>', unsafe_allow_html=True)
+    f1, f2, f3, f4, f5 = st.columns([1.25, 0.85, 0.85, 1.45, 0.65])
+    with f1:
+        filtro_placa = st.text_input("Placa ou composição")
+    with f2:
+        filtro_inicio = st.date_input("Vencimento inicial", value=None, format="DD/MM/YYYY")
+    with f3:
+        filtro_fim = st.date_input("Vencimento final", value=None, format="DD/MM/YYYY")
+    with f4:
+        filtro_documentos = st.multiselect(
+            "Documento/Laudo", TIPOS_DOCUMENTO, placeholder="Todos"
         )
-        .reset_index()
+    with f5:
+        data_referencia = st.date_input(
+            "Referência", value=date.today(), format="DD/MM/YYYY"
+        )
+
+    documentos_status = enriquecer_status(documentos_banco, data_referencia)
+    if "filtro_card" not in st.session_state:
+        st.session_state.filtro_card = "TODOS"
+
+    base_dos_cards = aplicar_filtros(
+        documentos_status,
+        filtro_placa,
+        filtro_inicio,
+        filtro_fim,
+        filtro_documentos,
+        "TODOS",
     )
-    resumo["_ordem"] = resumo["Status"].map({s: i for i, s in enumerate(ordem_status)}).fillna(99)
-    resumo = resumo.sort_values("_ordem").drop(columns="_ordem")
-    return resumo
+    contagens = {
+        "TODOS": len(base_dos_cards),
+        "VENCIDOS": int((base_dos_cards["Status"] == "VENCIDO").sum()),
+        "HOJE": int((base_dos_cards["Status"] == "VENCE HOJE").sum()),
+        "SEMANA": int(
+            base_dos_cards["Status"].isin(["VENCE HOJE", "VENCE NA SEMANA"]).sum()
+        ),
+        "MÊS": int((base_dos_cards["Status"] == "VENCE NO MÊS").sum()),
+        "OK": int((base_dos_cards["Status"] == "OK").sum()),
+    }
+    card_cols = st.columns(6)
+    labels = {
+        "TODOS": "Todos",
+        "VENCIDOS": "Vencidos",
+        "HOJE": "Vencem hoje",
+        "SEMANA": "Vencem na semana",
+        "MÊS": "Vencem no mês",
+        "OK": "Regulares",
+    }
+    for coluna, chave in zip(card_cols, labels):
+        with coluna:
+            ativo = "✓ " if st.session_state.filtro_card == chave else ""
+            if st.button(
+                f"{ativo}{labels[chave]}\n{contagens[chave]}", key=f"card_{chave}"
+            ):
+                st.session_state.filtro_card = chave
+                st.rerun()
 
+    filtrados = aplicar_filtros(
+        base_dos_cards,
+        "",
+        None,
+        None,
+        [],
+        st.session_state.filtro_card,
+    )
+    st.caption(
+        f"Filtro de card ativo: {labels[st.session_state.filtro_card]} · "
+        f"{len(filtrados)} documento(s) · "
+        f"referência {pd.Timestamp(data_referencia).strftime('%d/%m/%Y')}"
+    )
 
-def preparar_visual_detalhe(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    colunas = [
-        "Status",
-        "Composição",
-        "Equipamento",
-        "Placa",
-        "Documento",
-        "Vencimento",
-        "Dias p/ vencer",
-        "Origem atualização",
-    ]
-    return df[[c for c in colunas if c in df.columns]].copy()
+    st.markdown('<div class="faixa">Painéis por período</div>', unsafe_allow_html=True)
+    tab_vencidos, tab_semana, tab_mes = st.tabs(
+        ["Vencidos", "Vencimentos na semana", "Vencimentos no mês"]
+    )
+    with tab_vencidos:
+        painel_status(
+            "Documentos vencidos", filtrados, ["VENCIDO"], "Nenhum documento vencido."
+        )
+    with tab_semana:
+        painel_status(
+            "Vencimentos desta semana",
+            filtrados,
+            ["VENCE HOJE", "VENCE NA SEMANA"],
+            "Nenhum documento vence nesta semana.",
+        )
+    with tab_mes:
+        painel_status(
+            "Vencimentos após esta semana, ainda neste mês",
+            filtrados,
+            ["VENCE NO MÊS"],
+            "Nenhum documento vence no restante do mês.",
+        )
 
+    st.markdown('<div class="faixa">Painéis exclusivos</div>', unsafe_allow_html=True)
+    tab_afericao, tab_ambiental = st.tabs(
+        ["AFERIÇÃO", "IBAMA · CR IBAMA · CRLV"]
+    )
+    with tab_afericao:
+        dados = filtrados[filtrados["documento"] == "AFERIÇÃO"]
+        a1, a2, a3 = st.tabs(["Vencidos", "Semana", "Mês"])
+        with a1:
+            painel_status("Aferições vencidas", dados, ["VENCIDO"], "Nenhuma aferição vencida.")
+        with a2:
+            painel_status(
+                "Aferições da semana", dados, ["VENCE HOJE", "VENCE NA SEMANA"],
+                "Nenhuma aferição vence nesta semana."
+            )
+        with a3:
+            painel_status(
+                "Aferições do mês", dados, ["VENCE NO MÊS"],
+                "Nenhuma aferição vence no restante do mês."
+            )
+    with tab_ambiental:
+        dados = filtrados[
+            filtrados["documento"].isin(["IBAMA", "CR IBAMA", "CRLV"])
+        ]
+        i1, i2, i3 = st.tabs(["Vencidos", "Semana", "Mês"])
+        with i1:
+            painel_status(
+                "IBAMA, CR IBAMA e CRLV vencidos", dados, ["VENCIDO"],
+                "Nenhum documento deste grupo está vencido."
+            )
+        with i2:
+            painel_status(
+                "IBAMA, CR IBAMA e CRLV da semana", dados,
+                ["VENCE HOJE", "VENCE NA SEMANA"],
+                "Nenhum documento deste grupo vence nesta semana."
+            )
+        with i3:
+            painel_status(
+                "IBAMA, CR IBAMA e CRLV do mês", dados, ["VENCE NO MÊS"],
+                "Nenhum documento deste grupo vence no restante do mês."
+            )
 
-st.markdown('<div class="main-title">Painel online de vencimentos por composição</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="subtitle">Importe a base de composições e os Laudos KMM. O painel atualiza pela data do dia, mantém a composição em uma única linha e mostra qual documento está vencido, vence hoje ou será o próximo a vencer.</div>',
-    unsafe_allow_html=True,
-)
+    st.markdown(
+        '<div class="faixa">Composições com documentos no filtro</div>',
+        unsafe_allow_html=True,
+    )
+    st.dataframe(
+        estilizar_tabela(resumir_composicoes(filtrados)),
+        use_container_width=True,
+        hide_index=True,
+        height=390,
+    )
 
-with st.container():
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    col_imp1, col_imp2, col_imp3 = st.columns([1.1, 1.1, 0.65])
-    with col_imp1:
-        arquivo_base = st.file_uploader("Base controle de documentos", type=["xlsx"], key="base")
-    with col_imp2:
-        arquivo_kmm = st.file_uploader("Laudos KMM", type=["xlsx"], key="kmm")
-    with col_imp3:
-        data_ref = st.date_input("Data de referência", value=date.today(), format="DD/MM/YYYY")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-if arquivo_base and arquivo_kmm:
-    try:
-        xls_base = pd.ExcelFile(arquivo_base)
-        xls_kmm = pd.ExcelFile(arquivo_kmm)
-
-        with st.container():
-            st.markdown('<div class="section-card">', unsafe_allow_html=True)
-            col_aba1, col_aba2, col_status, col_busca, col_doc, col_equip = st.columns([1, 1, 1.3, 1.15, 1.05, 1.05])
-            with col_aba1:
-                aba_base = st.selectbox("Aba base", xls_base.sheet_names, index=0)
-            with col_aba2:
-                aba_kmm = st.selectbox("Aba KMM", xls_kmm.sheet_names, index=0)
-            with col_status:
-                status_filtro = st.multiselect(
-                    "Status",
-                    ["Todos", "VENCIDO", "VENCE HOJE", "VENCE NA SEMANA", "VENCE NO MÊS", "OK"],
-                    default=["VENCIDO", "VENCE HOJE", "VENCE NA SEMANA", "VENCE NO MÊS"],
+    with st.expander("Detalhes, histórico e backup", expanded=False):
+        tab_detalhe, tab_historico, tab_backup, tab_importacoes = st.tabs(
+            ["Detalhes", "Registros substituídos", "Último backup", "Importações"]
+        )
+        historico = carregar_historico()
+        importacoes = carregar_importacoes()
+        backup, backup_id = carregar_ultimo_backup()
+        with tab_detalhe:
+            st.dataframe(
+                estilizar_tabela(preparar_detalhe(filtrados)),
+                use_container_width=True,
+                hide_index=True,
+                height=360,
+            )
+        with tab_historico:
+            st.caption("Versões que foram substituídas por um vencimento mais recente.")
+            st.dataframe(
+                estilizar_tabela(historico), use_container_width=True,
+                hide_index=True, height=360
+            )
+        with tab_backup:
+            if backup_id is None:
+                st.info("Ainda não há snapshot anterior disponível.")
+            else:
+                st.caption(f"Estado do banco antes da importação {backup_id}.")
+                st.dataframe(
+                    estilizar_tabela(backup), use_container_width=True,
+                    hide_index=True, height=360
                 )
-            with col_busca:
-                placa_filtro = st.text_input("Buscar placa/composição")
-            with col_doc:
-                doc_filtro = st.multiselect("Documento", ["Todos", "CIV", "CIPP", "AFERIÇÃO", "CRONOTACÓGRAFO"], default=["Todos"])
-            with col_equip:
-                equip_filtro = st.multiselect("Equipamento", ["Todos", "Cavalo", "Carreta 1", "Carreta 2"], default=["Todos"])
-            st.markdown('</div>', unsafe_allow_html=True)
-
-        df_base = ler_base(arquivo_base, aba_base)
-        df_kmm = ler_kmm(arquivo_kmm, aba_kmm)
-        indice = montar_indice_kmm(df_kmm)
-        relatorios = montar_relatorios(df_base, indice, data_ref)
-
-        detalhe = relatorios["detalhe_documentos"]
-        detalhe_filtrado = aplicar_filtros(detalhe, placa_filtro, doc_filtro, equip_filtro, status_filtro)
-        comp_filtrada = aplicar_filtros_composicao(relatorios["base_atualizada"], detalhe_filtrado)
-        comp_filtrada = dataframe_datas(comp_filtrada)
-        detalhe_visual = preparar_visual_detalhe(detalhe_filtrado)
-        resumo_status = montar_resumo_status(detalhe_filtrado)
-
-        st.markdown(
-            f'<div class="small-caption">{formatar_periodo(relatorios, data_ref)}</div>',
-            unsafe_allow_html=True,
-        )
-
-        k1, k2, k3, k4, k5, k6 = st.columns(6)
-        with k1:
-            metric_card("Composições", len(relatorios["base_atualizada"]), "total na base", "neutral")
-        with k2:
-            metric_card("Documentos", len(relatorios["detalhe_documentos"]), "analisados", "neutral")
-        with k3:
-            metric_card("Vencidos", len(relatorios["vencidos"]), "composições", "danger")
-        with k4:
-            metric_card("Hoje", len(relatorios["vencem_hoje"]), "vence hoje", "warning")
-        with k5:
-            metric_card("Semana", len(relatorios["vencem_semana"]), "próximos dias", "warning")
-        with k6:
-            metric_card("Mês", len(relatorios["vencem_mes"]), "após esta semana", "month")
-
-        st.divider()
-
-        topo1, topo2 = st.columns([0.62, 0.38])
-        with topo1:
-            st.subheader("Composições com documentos no filtro")
-            st.caption("Visual principal: uma linha por composição, apenas placas, status e datas.")
+        with tab_importacoes:
             st.dataframe(
-                comp_filtrada,
-                use_container_width=True,
-                hide_index=True,
-                height=430,
-                column_config=configurar_colunas_datas(comp_filtrada),
-            )
-        with topo2:
-            st.subheader("Resumo do filtro")
-            st.caption("Quantidade de documentos e composições por status.")
-            st.dataframe(
-                resumo_status,
-                use_container_width=True,
-                hide_index=True,
-                height=248,
-                column_config=configurar_colunas_datas(resumo_status),
+                estilizar_tabela(importacoes), use_container_width=True,
+                hide_index=True, height=360
             )
 
-            excel_bytes = exportar_excel(relatorios, data_ref, detalhe_filtrado, comp_filtrada)
-            st.download_button(
-                "Baixar Excel filtrado",
-                data=excel_bytes,
-                file_name=f"vencimentos_documentos_{pd.Timestamp(data_ref).strftime('%Y%m%d')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            st.info("Regra aplicada: o KMM atualiza por placa + tipo de laudo; quando existe mais de um vencimento, o sistema usa o maior vencimento como documento vigente. O status muda automaticamente conforme a data de referência: hoje aparece como VENCE HOJE, amanhã passa para VENCIDO e o painel continua mostrando o próximo documento futuro da composição.")
-
-        st.subheader("Detalhe dos documentos encontrados")
-        st.caption("Use essa tabela para saber exatamente qual documento da composição está vencido ou próximo do vencimento.")
-        st.dataframe(
-            detalhe_visual,
+        excel = gerar_excel(filtrados, historico, importacoes)
+        st.download_button(
+            "Baixar relatório e histórico em Excel",
+            data=excel,
+            file_name=f"painel_vencimentos_{date.today():%Y%m%d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
-            hide_index=True,
-            height=330,
-            column_config=configurar_colunas_datas(detalhe_visual),
         )
 
-    except Exception as erro:
-        st.error(f"Não foi possível gerar o relatório: {erro}")
-else:
-    st.info("Envie as duas planilhas acima para liberar o painel. Depois disso, tudo aparece na mesma tela, sem abas.")
+    st.info(
+        "Regra de atualização: cada registro ativo é identificado por placa + tipo de "
+        "documento. O maior vencimento permanece ativo; duplicatas e datas mais antigas "
+        "são ignoradas. Antes de cada importação, o estado completo do banco é salvo."
+    )
+
+
+if __name__ == "__main__":
+    main()

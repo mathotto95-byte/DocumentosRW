@@ -2,7 +2,7 @@ import re
 import sqlite3
 import unicodedata
 from datetime import date, datetime, timedelta
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -248,6 +248,38 @@ def inicializar_banco() -> None:
                 ignorados INTEGER NOT NULL DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS base_composicoes_ativa (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                conteudo_json TEXT NOT NULL,
+                nome_arquivo TEXT,
+                nome_aba TEXT,
+                total_linhas INTEGER NOT NULL,
+                atualizado_em TEXT NOT NULL,
+                atualizado_por TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS backup_bases_composicoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conteudo_json TEXT NOT NULL,
+                nome_arquivo TEXT,
+                nome_aba TEXT,
+                total_linhas INTEGER NOT NULL,
+                atualizado_em TEXT NOT NULL,
+                atualizado_por TEXT NOT NULL,
+                backup_em TEXT NOT NULL,
+                backup_por TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS historico_bases_composicoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_hora TEXT NOT NULL,
+                usuario TEXT NOT NULL,
+                nome_arquivo TEXT,
+                nome_aba TEXT,
+                total_linhas INTEGER NOT NULL,
+                acao TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS documentos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 placa TEXT NOT NULL,
@@ -323,6 +355,8 @@ def inicializar_banco() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_documentos_vencimento
                 ON documentos(vencimento);
+            CREATE INDEX IF NOT EXISTS idx_historico_bases_data
+                ON historico_bases_composicoes(data_hora DESC);
             CREATE INDEX IF NOT EXISTS idx_historico_placa_documento
                 ON historico_documentos(placa, documento);
             CREATE INDEX IF NOT EXISTS idx_atualizacoes_data
@@ -370,6 +404,139 @@ def inicializar_banco() -> None:
                 )
                 """
             )
+
+
+def serializar_base_composicoes(df_base: pd.DataFrame) -> str:
+    base = df_base.copy()
+    base.columns = [str(coluna) for coluna in base.columns]
+    return base.to_json(
+        orient="split", date_format="iso", force_ascii=False, default_handler=str
+    )
+
+
+def desserializar_base_composicoes(conteudo_json: str) -> pd.DataFrame:
+    if not conteudo_json:
+        return pd.DataFrame()
+    return pd.read_json(StringIO(conteudo_json), orient="split", dtype=False)
+
+
+def carregar_base_composicoes() -> tuple[pd.DataFrame, dict | None]:
+    with conectar() as conn:
+        registro = conn.execute(
+            "SELECT * FROM base_composicoes_ativa WHERE id = 1"
+        ).fetchone()
+    if registro is None:
+        return pd.DataFrame(), None
+    metadata = {
+        "nome_arquivo": registro["nome_arquivo"],
+        "nome_aba": registro["nome_aba"],
+        "total_linhas": registro["total_linhas"],
+        "atualizado_em": registro["atualizado_em"],
+        "atualizado_por": registro["atualizado_por"],
+    }
+    return desserializar_base_composicoes(registro["conteudo_json"]), metadata
+
+
+def salvar_base_composicoes(
+    df_base: pd.DataFrame,
+    usuario: str,
+    nome_arquivo: str,
+    nome_aba: str,
+) -> dict:
+    if df_base.empty:
+        raise ValueError("A base de composições importada está vazia.")
+    momento = agora_local().isoformat(timespec="seconds")
+    conteudo_json = serializar_base_composicoes(df_base)
+    total_linhas = len(df_base)
+    with conectar() as conn:
+        anterior = conn.execute(
+            "SELECT * FROM base_composicoes_ativa WHERE id = 1"
+        ).fetchone()
+        acao = "BASE INICIAL" if anterior is None else "SUBSTITUIÇÃO DA BASE"
+        if anterior is not None:
+            conn.execute(
+                """
+                INSERT INTO backup_bases_composicoes (
+                    conteudo_json, nome_arquivo, nome_aba, total_linhas,
+                    atualizado_em, atualizado_por, backup_em, backup_por
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    anterior["conteudo_json"], anterior["nome_arquivo"],
+                    anterior["nome_aba"], anterior["total_linhas"],
+                    anterior["atualizado_em"], anterior["atualizado_por"],
+                    momento, usuario,
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO base_composicoes_ativa (
+                id, conteudo_json, nome_arquivo, nome_aba, total_linhas,
+                atualizado_em, atualizado_por
+            ) VALUES (1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                conteudo_json = excluded.conteudo_json,
+                nome_arquivo = excluded.nome_arquivo,
+                nome_aba = excluded.nome_aba,
+                total_linhas = excluded.total_linhas,
+                atualizado_em = excluded.atualizado_em,
+                atualizado_por = excluded.atualizado_por
+            """,
+            (
+                conteudo_json, nome_arquivo, nome_aba, total_linhas,
+                momento, usuario,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO historico_bases_composicoes (
+                data_hora, usuario, nome_arquivo, nome_aba, total_linhas, acao
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (momento, usuario, nome_arquivo, nome_aba, total_linhas, acao),
+        )
+    return {
+        "nome_arquivo": nome_arquivo,
+        "nome_aba": nome_aba,
+        "total_linhas": total_linhas,
+        "atualizado_em": momento,
+        "atualizado_por": usuario,
+        "acao": acao,
+    }
+
+
+def carregar_ultimo_backup_base() -> tuple[pd.DataFrame, dict | None]:
+    with conectar() as conn:
+        registro = conn.execute(
+            "SELECT * FROM backup_bases_composicoes ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    if registro is None:
+        return pd.DataFrame(), None
+    metadata = {
+        "nome_arquivo": registro["nome_arquivo"],
+        "nome_aba": registro["nome_aba"],
+        "total_linhas": registro["total_linhas"],
+        "atualizado_em": registro["atualizado_em"],
+        "atualizado_por": registro["atualizado_por"],
+        "backup_em": registro["backup_em"],
+        "backup_por": registro["backup_por"],
+    }
+    return desserializar_base_composicoes(registro["conteudo_json"]), metadata
+
+
+def carregar_historico_bases() -> pd.DataFrame:
+    historico = consultar_sql(
+        """
+        SELECT data_hora AS "Data/hora", usuario AS "Usuário",
+               nome_arquivo AS "Arquivo", nome_aba AS "Aba",
+               total_linhas AS "Linhas", acao AS "Ação"
+        FROM historico_bases_composicoes
+        ORDER BY id DESC
+        """
+    )
+    if not historico.empty:
+        historico["Data/hora"] = historico["Data/hora"].apply(formatar_data_hora)
+    return historico
 
 
 def salvar_importacao(
@@ -855,6 +1022,37 @@ def extrair_composicoes_e_fallbacks(df_base: pd.DataFrame) -> tuple[dict, list[d
     return mapa_placas, fallbacks
 
 
+def atualizar_vinculos_documentos(df_base: pd.DataFrame) -> int:
+    mapa_placas, _ = extrair_composicoes_e_fallbacks(df_base)
+    atualizados = 0
+    with conectar() as conn:
+        documentos = conn.execute("SELECT id, placa FROM documentos").fetchall()
+        for documento in documentos:
+            vinculo = mapa_placas.get(documento["placa"])
+            if vinculo:
+                valores = (
+                    vinculo["composicao"], vinculo["placa_cavalo"],
+                    vinculo["placa_carreta_1"], vinculo["placa_carreta_2"],
+                    vinculo["equipamento"], documento["id"],
+                )
+            else:
+                valores = (
+                    documento["placa"], "", "", "", "Não vinculado",
+                    documento["id"],
+                )
+            conn.execute(
+                """
+                UPDATE documentos SET
+                    composicao = ?, placa_cavalo = ?, placa_carreta_1 = ?,
+                    placa_carreta_2 = ?, equipamento = ?
+                WHERE id = ?
+                """,
+                valores,
+            )
+            atualizados += 1
+    return atualizados
+
+
 def preparar_registros_importacao(
     df_base: pd.DataFrame, df_documentos: pd.DataFrame
 ) -> list[dict]:
@@ -1244,7 +1442,21 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    base_salva, metadata_base = carregar_base_composicoes()
+
     with st.expander("Importar e atualizar o banco de dados", expanded=False):
+        if metadata_base:
+            st.success(
+                "Base de composições salva: "
+                f"{metadata_base['nome_arquivo']} · {metadata_base['total_linhas']} linhas · "
+                f"alterada em {formatar_data_hora(metadata_base['atualizado_em'])} "
+                f"por {metadata_base['atualizado_por']}."
+            )
+        else:
+            st.warning(
+                "Nenhuma base de composições encontrada. Importe a base inicial para "
+                "iniciar o sistema."
+            )
         col_usuario, col_base, col_documentos = st.columns([0.7, 1.15, 1.15])
         with col_usuario:
             usuario = st.text_input(
@@ -1252,11 +1464,15 @@ def main() -> None:
             )
         with col_base:
             arquivo_base = st.file_uploader(
-                "Base de composições", type=["xlsx", "xls"], key="base"
+                "Nova base de composições (opcional)",
+                type=["xlsx", "xls"],
+                key="base",
             )
         with col_documentos:
             arquivo_documentos = st.file_uploader(
-                "Laudos/documentos", type=["xlsx", "xls"], key="documentos"
+                "Laudos/documentos (opcional)",
+                type=["xlsx", "xls"],
+                key="documentos",
             )
 
         aba_base = aba_documentos = None
@@ -1270,46 +1486,94 @@ def main() -> None:
             abas_documentos = pd.ExcelFile(arquivo_documentos).sheet_names
         else:
             abas_documentos = []
-        if abas_base and abas_documentos:
-            c1, c2 = st.columns(2)
+        c1, c2 = st.columns(2)
+        if abas_base:
             with c1:
                 aba_base = st.selectbox("Aba da base", abas_base)
+        if abas_documentos:
             with c2:
                 aba_documentos = st.selectbox("Aba dos documentos", abas_documentos)
 
         if st.button("Importar e atualizar banco", key="executar_importacao"):
             if not usuario.strip():
                 st.error("Informe o usuário responsável pela importação.")
-            elif not arquivo_base or not arquivo_documentos:
-                st.error("Envie a base de composições e a planilha de documentos.")
+            elif not arquivo_base and not arquivo_documentos:
+                st.error("Envie uma nova base de composições ou os Laudos/Documentos.")
+            elif not arquivo_base and metadata_base is None:
+                st.error(
+                    "Nenhuma base de composições encontrada. Importe a base inicial para "
+                    "iniciar o sistema."
+                )
             else:
                 try:
                     with st.spinner("Validando, criando backup e atualizando o banco..."):
-                        df_base = ler_base(arquivo_base, aba_base)
-                        df_documentos = ler_planilha_documentos(
-                            arquivo_documentos, aba_documentos
+                        nova_base = arquivo_base is not None
+                        df_base_usada = (
+                            ler_base(arquivo_base, aba_base) if nova_base else base_salva
                         )
-                        registros = preparar_registros_importacao(df_base, df_documentos)
-                        if not registros:
-                            raise ValueError("Nenhum documento válido foi encontrado.")
-                        resultado = salvar_importacao(
-                            registros,
-                            usuario,
-                            arquivo_base.name,
-                            arquivo_documentos.name,
+                        registros = []
+                        if arquivo_documentos:
+                            df_documentos = ler_planilha_documentos(
+                                arquivo_documentos, aba_documentos
+                            )
+                            registros = preparar_registros_importacao(
+                                df_base_usada, df_documentos
+                            )
+                            if not registros:
+                                raise ValueError("Nenhum documento válido foi encontrado.")
+                        elif nova_base:
+                            _, registros = extrair_composicoes_e_fallbacks(df_base_usada)
+
+                        resultado_base = None
+                        if nova_base:
+                            resultado_base = salvar_base_composicoes(
+                                df_base_usada, usuario, arquivo_base.name, aba_base
+                            )
+                            atualizar_vinculos_documentos(df_base_usada)
+
+                        resultado = None
+                        if registros:
+                            nome_base = (
+                                arquivo_base.name if nova_base
+                                else metadata_base.get("nome_arquivo", "BASE SALVA")
+                            )
+                            resultado = salvar_importacao(
+                                registros,
+                                usuario,
+                                nome_base,
+                                arquivo_documentos.name if arquivo_documentos else "",
+                            )
+
+                    mensagens = []
+                    if resultado_base:
+                        mensagens.append(
+                            f"Base de composições salva ({resultado_base['total_linhas']} linhas)"
                         )
-                    st.success(
-                        f"Importação {resultado['importacao_id']} concluída: "
-                        f"{resultado['inseridos']} inseridos, "
-                        f"{resultado['atualizados']} atualizados e "
-                        f"{resultado['ignorados']} duplicados/mais antigos ignorados."
-                    )
+                    if resultado:
+                        mensagens.append(
+                            f"importação {resultado['importacao_id']}: "
+                            f"{resultado['inseridos']} inseridos, "
+                            f"{resultado['atualizados']} atualizados e "
+                            f"{resultado['ignorados']} ignorados"
+                        )
+                    st.success(" · ".join(mensagens) + ".")
                 except Exception as erro:
                     st.error(f"Não foi possível importar: {erro}")
 
+    base_salva, metadata_base = carregar_base_composicoes()
+    if metadata_base is None:
+        st.warning(
+            "Nenhuma base de composições encontrada. Importe a base inicial para iniciar "
+            "o sistema."
+        )
+        return
+
     documentos_banco = carregar_documentos()
     if documentos_banco.empty:
-        st.info("O banco ainda está vazio. Faça a primeira importação acima.")
+        st.info(
+            "A base de composições está salva. Importe os Laudos/Documentos para iniciar "
+            "a análise dos vencimentos."
+        )
         return
 
     st.markdown('<div class="faixa">Filtros principais</div>', unsafe_allow_html=True)
@@ -1471,12 +1735,20 @@ def main() -> None:
     mostrar_ultimos_atualizados(auditoria, filtrados)
 
     with st.expander("Detalhes, histórico e backup", expanded=False):
-        tab_detalhe, tab_historico, tab_backup, tab_importacoes = st.tabs(
-            ["Detalhes", "Registros substituídos", "Último backup", "Importações"]
+        (
+            tab_detalhe, tab_historico, tab_backup, tab_importacoes,
+            tab_backup_base, tab_historico_base,
+        ) = st.tabs(
+            [
+                "Detalhes", "Registros substituídos", "Backup documentos",
+                "Importações", "Backup da base", "Histórico da base",
+            ]
         )
         historico = carregar_historico()
         importacoes = carregar_importacoes()
         backup, backup_id = carregar_ultimo_backup()
+        backup_base, metadata_backup_base = carregar_ultimo_backup_base()
+        historico_bases = carregar_historico_bases()
         with tab_detalhe:
             st.dataframe(
                 estilizar_tabela(preparar_detalhe(filtrados)),
@@ -1504,6 +1776,26 @@ def main() -> None:
                 estilizar_tabela(importacoes), use_container_width=True,
                 hide_index=True, height=360
             )
+        with tab_backup_base:
+            if metadata_backup_base is None:
+                st.info("Ainda não há uma base de composições anterior no backup.")
+            else:
+                st.caption(
+                    f"Base anterior: {metadata_backup_base['nome_arquivo']} · "
+                    f"{metadata_backup_base['total_linhas']} linhas · salva originalmente "
+                    f"em {formatar_data_hora(metadata_backup_base['atualizado_em'])} por "
+                    f"{metadata_backup_base['atualizado_por']} · backup criado em "
+                    f"{formatar_data_hora(metadata_backup_base['backup_em'])}."
+                )
+                st.dataframe(
+                    estilizar_tabela(backup_base), use_container_width=True,
+                    hide_index=True, height=360
+                )
+        with tab_historico_base:
+            st.dataframe(
+                estilizar_tabela(historico_bases), use_container_width=True,
+                hide_index=True, height=360
+            )
 
         excel = gerar_excel(filtrados, historico, importacoes, auditoria)
         st.download_button(
@@ -1517,7 +1809,8 @@ def main() -> None:
     st.info(
         "Regra de atualização: cada registro ativo é identificado por placa + tipo de "
         "documento. O maior vencimento permanece ativo; duplicatas e datas mais antigas "
-        "são ignoradas. Antes de cada importação, o estado completo do banco é salvo."
+        "são ignoradas. A última base de composições salva é reutilizada automaticamente "
+        "quando uma nova base não é enviada."
     )
 
     st.markdown(

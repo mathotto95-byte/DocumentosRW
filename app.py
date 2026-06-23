@@ -1649,15 +1649,12 @@ def main() -> None:
     )
 
     st.markdown('<div class="faixa">Painéis por período</div>', unsafe_allow_html=True)
-    tab_vencidos, tab_semana, tab_mes = st.tabs(
-        ["Vencidos", "Vencimentos na semana", "Vencimentos no mês"]
-    )
-    with tab_vencidos:
+    with st.expander("Vencidos", expanded=False):
         painel_status(
             "Documentos vencidos", filtrados, ["VENCIDO"],
             "Nenhum documento vencido.", auditoria
         )
-    with tab_semana:
+    with st.expander("Vencimentos na semana", expanded=False):
         painel_status(
             "Vencimentos desta semana",
             filtrados,
@@ -1665,7 +1662,7 @@ def main() -> None:
             "Nenhum documento vence nesta semana.",
             auditoria,
         )
-    with tab_mes:
+    with st.expander("Vencimentos no mês", expanded=False):
         painel_status(
             "Vencimentos após esta semana, ainda neste mês",
             filtrados,
@@ -1675,10 +1672,7 @@ def main() -> None:
         )
 
     st.markdown('<div class="faixa">Painéis exclusivos</div>', unsafe_allow_html=True)
-    tab_afericao, tab_ambiental, tab_crlv = st.tabs(
-        ["Aferições", "IBAMA · CR IBAMA · AETs", "CRLV"]
-    )
-    with tab_afericao:
+    with st.expander("Aferições", expanded=False):
         dados = filtrados[
             filtrados["documento"].isin(["AFERIÇÃO", "AGENDAMENTO AFERIÇÃO"])
         ]
@@ -1693,7 +1687,7 @@ def main() -> None:
                 height=360,
             )
         mostrar_ultimos_atualizados(auditoria, dados)
-    with tab_ambiental:
+    with st.expander("IBAMA · CR IBAMA · AETs", expanded=False):
         dados = filtrados[
             filtrados["documento"].isin(["IBAMA", "CR IBAMA", "AETs"])
         ]
@@ -1708,7 +1702,7 @@ def main() -> None:
                 height=280,
             )
         mostrar_ultimos_atualizados(auditoria, dados)
-    with tab_crlv:
+    with st.expander("CRLV", expanded=False):
         dados = filtrados[filtrados["documento"] == "CRLV"]
         st.subheader("CRLV")
         if dados.empty:
@@ -1722,17 +1716,14 @@ def main() -> None:
             )
         mostrar_ultimos_atualizados(auditoria, dados)
 
-    st.markdown(
-        '<div class="faixa">Composições com documentos no filtro</div>',
-        unsafe_allow_html=True,
-    )
-    st.dataframe(
-        estilizar_tabela(resumir_composicoes(filtrados)),
-        use_container_width=True,
-        hide_index=True,
-        height=390,
-    )
-    mostrar_ultimos_atualizados(auditoria, filtrados)
+    with st.expander("Composições com documentos no filtro", expanded=False):
+        st.dataframe(
+            estilizar_tabela(resumir_composicoes(filtrados)),
+            use_container_width=True,
+            hide_index=True,
+            height=390,
+        )
+        mostrar_ultimos_atualizados(auditoria, filtrados)
 
     with st.expander("Detalhes, histórico e backup", expanded=False):
         (
@@ -1813,20 +1804,17 @@ def main() -> None:
         "quando uma nova base não é enviada."
     )
 
-    st.markdown(
-        '<div class="faixa">Histórico de Atualização</div>',
-        unsafe_allow_html=True,
-    )
-    st.caption(
-        "Auditoria das inserções e alterações registradas no banco de dados."
-    )
-    st.dataframe(
-        estilizar_tabela(preparar_historico_atualizacoes(auditoria)),
-        use_container_width=True,
-        hide_index=True,
-        height=430,
-    )
-    mostrar_ultimos_atualizados(auditoria, documentos_status)
+    with st.expander("Histórico de Atualização", expanded=False):
+        st.caption(
+            "Auditoria das inserções e alterações registradas no banco de dados."
+        )
+        st.dataframe(
+            estilizar_tabela(preparar_historico_atualizacoes(auditoria)),
+            use_container_width=True,
+            hide_index=True,
+            height=430,
+        )
+        mostrar_ultimos_atualizados(auditoria, documentos_status)
 
 
 if __name__ == "__main__":

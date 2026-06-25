@@ -41,6 +41,11 @@ STATUS_ORDEM = {
     "SEM DATA": 5,
 }
 
+COMANDO_RESTAURAR = "RESTAURAR"
+COMANDO_RESTAURAR_BASE = "RESTAURAR BASE"
+COMANDO_ZERAR_BANCO = "ZERAR BANCO"
+COLUNAS_MINIMAS_BASE = 8
+
 
 # =========================================================
 # UTILIDADES
@@ -788,6 +793,192 @@ def carregar_importacoes() -> pd.DataFrame:
     )
 
 
+def carregar_importacoes_reversao() -> pd.DataFrame:
+    return consultar_sql(
+        """
+        SELECT i.id AS importacao_id, i.data_hora, i.usuario, i.arquivo_base,
+               i.arquivo_documentos, i.total_recebidos, i.inseridos, i.atualizados,
+               i.ignorados,
+               (
+                   SELECT COUNT(*)
+                   FROM backup_documentos b
+                   WHERE b.importacao_id = i.id
+               ) AS registros_backup
+        FROM importacoes i
+        ORDER BY i.id DESC
+        LIMIT 50
+        """
+    )
+
+
+def restaurar_backup_importacao(importacao_id: int, usuario: str) -> dict:
+    usuario = usuario.strip()
+    momento = agora_local().isoformat(timespec="seconds")
+    with conectar() as conn:
+        importacao = conn.execute(
+            "SELECT * FROM importacoes WHERE id = ?", (importacao_id,)
+        ).fetchone()
+        if importacao is None:
+            raise ValueError("Importacao nao encontrada.")
+
+        backup = conn.execute(
+            """
+            SELECT placa, documento, vencimento, composicao, placa_cavalo,
+                   placa_carreta_1, placa_carreta_2, equipamento, origem,
+                   importado_em, importado_por, importacao_original_id
+            FROM backup_documentos
+            WHERE importacao_id = ?
+            ORDER BY id
+            """,
+            (importacao_id,),
+        ).fetchall()
+        total_antes = conn.execute("SELECT COUNT(*) FROM documentos").fetchone()[0]
+
+        conn.execute("DELETE FROM documentos")
+        for registro in backup:
+            conn.execute(
+                """
+                INSERT INTO documentos (
+                    placa, documento, vencimento, composicao, placa_cavalo,
+                    placa_carreta_1, placa_carreta_2, equipamento, origem,
+                    importado_em, importado_por, importacao_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    registro["placa"], registro["documento"],
+                    registro["vencimento"], registro["composicao"],
+                    registro["placa_cavalo"], registro["placa_carreta_1"],
+                    registro["placa_carreta_2"], registro["equipamento"],
+                    registro["origem"], registro["importado_em"],
+                    registro["importado_por"], registro["importacao_original_id"],
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO historico_atualizacoes (
+                    data_hora, usuario, documento, placa, composicao,
+                    vencimento_anterior, novo_vencimento, origem, acao,
+                    importacao_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    momento, usuario, registro["documento"], registro["placa"],
+                    registro["composicao"], None, registro["vencimento"],
+                    f"RESTAURACAO DO BACKUP ANTERIOR A IMPORTACAO {importacao_id}",
+                    "RESTAURACAO", importacao_id,
+                ),
+            )
+
+    return {
+        "importacao_id": importacao_id,
+        "registros_antes": total_antes,
+        "registros_restaurados": len(backup),
+    }
+
+
+def restaurar_ultimo_backup_base_composicoes(usuario: str) -> dict:
+    usuario = usuario.strip()
+    momento = agora_local().isoformat(timespec="seconds")
+    with conectar() as conn:
+        backup = conn.execute(
+            "SELECT * FROM backup_bases_composicoes ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if backup is None:
+            raise ValueError("Ainda nao existe backup anterior da base de composicoes.")
+
+        atual = conn.execute(
+            "SELECT * FROM base_composicoes_ativa WHERE id = 1"
+        ).fetchone()
+        if atual is not None:
+            conn.execute(
+                """
+                INSERT INTO backup_bases_composicoes (
+                    conteudo_json, nome_arquivo, nome_aba, total_linhas,
+                    atualizado_em, atualizado_por, backup_em, backup_por
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    atual["conteudo_json"], atual["nome_arquivo"],
+                    atual["nome_aba"], atual["total_linhas"],
+                    atual["atualizado_em"], atual["atualizado_por"],
+                    momento, usuario,
+                ),
+            )
+
+        conn.execute(
+            """
+            INSERT INTO base_composicoes_ativa (
+                id, conteudo_json, nome_arquivo, nome_aba, total_linhas,
+                atualizado_em, atualizado_por
+            ) VALUES (1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                conteudo_json = excluded.conteudo_json,
+                nome_arquivo = excluded.nome_arquivo,
+                nome_aba = excluded.nome_aba,
+                total_linhas = excluded.total_linhas,
+                atualizado_em = excluded.atualizado_em,
+                atualizado_por = excluded.atualizado_por
+            """,
+            (
+                backup["conteudo_json"], backup["nome_arquivo"],
+                backup["nome_aba"], backup["total_linhas"], momento, usuario,
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO historico_bases_composicoes (
+                data_hora, usuario, nome_arquivo, nome_aba, total_linhas, acao
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                momento, usuario, backup["nome_arquivo"], backup["nome_aba"],
+                backup["total_linhas"], "RESTAURACAO DO BACKUP",
+            ),
+        )
+
+    df_restaurada = desserializar_base_composicoes(backup["conteudo_json"])
+    vinculos = atualizar_vinculos_documentos(df_restaurada)
+    return {
+        "nome_arquivo": backup["nome_arquivo"],
+        "total_linhas": backup["total_linhas"],
+        "vinculos_atualizados": vinculos,
+    }
+
+
+def zerar_banco_dados(usuario: str) -> dict:
+    usuario = usuario.strip()
+    with conectar() as conn:
+        totais = {
+            "documentos": conn.execute("SELECT COUNT(*) FROM documentos").fetchone()[0],
+            "importacoes": conn.execute("SELECT COUNT(*) FROM importacoes").fetchone()[0],
+            "bases": conn.execute(
+                "SELECT COUNT(*) FROM base_composicoes_ativa"
+            ).fetchone()[0],
+        }
+        for tabela in [
+            "documentos",
+            "historico_documentos",
+            "historico_atualizacoes",
+            "backup_documentos",
+            "importacoes",
+            "base_composicoes_ativa",
+            "backup_bases_composicoes",
+            "historico_bases_composicoes",
+        ]:
+            conn.execute(f"DELETE FROM {tabela}")
+        conn.execute(
+            """
+            DELETE FROM sqlite_sequence
+            WHERE name IN (
+                'importacoes', 'documentos', 'historico_documentos',
+                'historico_atualizacoes', 'backup_documentos',
+                'backup_bases_composicoes', 'historico_bases_composicoes'
+            )
+            """
+        )
+    return {**totais, "usuario": usuario}
+
+
 def carregar_historico() -> pd.DataFrame:
     df = consultar_sql(
         """
@@ -849,6 +1040,36 @@ def localizar_linha_cabecalho_documentos(df_bruto: pd.DataFrame) -> int:
     )
 
 
+def placa_modelo_valida(valor) -> bool:
+    placa = limpar_placa(valor)
+    return bool(re.fullmatch(r"[A-Z]{3}[0-9][A-Z0-9][0-9]{2}", placa))
+
+
+def validar_modelo_base(df_base: pd.DataFrame) -> None:
+    if df_base.empty:
+        raise ValueError("A base de composicoes importada esta vazia.")
+    if len(df_base.columns) < COLUNAS_MINIMAS_BASE:
+        raise ValueError(
+            "A base de composicoes nao esta no modelo padrao. "
+            "Use a planilha com as colunas: cavalo, CIV cavalo, cronotacografo, "
+            "carreta 1, carreta 2, CIV carretas, CIPP carretas e afericao."
+        )
+
+    linhas_validas = 0
+    for _, row in df_base.iterrows():
+        if (
+            placa_modelo_valida(valor_posicional(row, 0))
+            or placa_modelo_valida(valor_posicional(row, 3))
+            or placa_modelo_valida(valor_posicional(row, 4))
+        ):
+            linhas_validas += 1
+    if linhas_validas == 0:
+        raise ValueError(
+            "A base de composicoes nao parece seguir o modelo padrao: "
+            "nao encontrei placas validas nas colunas de cavalo/carreta."
+        )
+
+
 def ler_planilha_documentos(arquivo, aba: str) -> pd.DataFrame:
     arquivo.seek(0)
     bruto = pd.read_excel(arquivo, sheet_name=aba, header=None, dtype=object)
@@ -860,7 +1081,9 @@ def ler_planilha_documentos(arquivo, aba: str) -> pd.DataFrame:
 
 def ler_base(arquivo, aba: str) -> pd.DataFrame:
     arquivo.seek(0)
-    return pd.read_excel(arquivo, sheet_name=aba, dtype=object).dropna(how="all")
+    df_base = pd.read_excel(arquivo, sheet_name=aba, dtype=object).dropna(how="all")
+    validar_modelo_base(df_base)
+    return df_base
 
 
 def localizar_coluna(colunas, candidatos: list[str], contem: list[str] | None = None):
@@ -928,6 +1151,11 @@ def extrair_documentos_origem(df: pd.DataFrame) -> list[dict]:
                     "alterado_por_origem": alterado_por,
                 }
             )
+    if not registros:
+        raise ValueError(
+            "A planilha de documentos nao esta no modelo padrao ou nao possui "
+            "linhas validas com Placa, Documento/Laudo e Vencimento."
+        )
     return registros
 
 
@@ -1561,6 +1789,143 @@ def main() -> None:
                     st.error(f"Não foi possível importar: {erro}")
 
     base_salva, metadata_base = carregar_base_composicoes()
+
+    with st.expander("Seguranca do banco: voltar ou zerar", expanded=False):
+        mensagem_seguranca = st.session_state.pop("mensagem_seguranca", None)
+        if mensagem_seguranca:
+            st.success(mensagem_seguranca)
+        st.warning(
+            "Use estas opcoes somente quando uma importacao tiver sido feita com "
+            "dados errados. Para voltar, o sistema restaura o snapshot salvo antes "
+            "da importacao escolhida."
+        )
+        tab_voltar, tab_base, tab_zerar = st.tabs(
+            ["Voltar importacao", "Voltar base", "Zerar banco"]
+        )
+        with tab_voltar:
+            importacoes_reversao = carregar_importacoes_reversao()
+            if importacoes_reversao.empty:
+                st.info("Ainda nao ha importacoes para restaurar.")
+            else:
+                opcoes = importacoes_reversao.to_dict("records")
+                selecionada = st.selectbox(
+                    "Escolha a importacao que deseja desfazer",
+                    opcoes,
+                    format_func=lambda item: (
+                        f"#{item['importacao_id']} - "
+                        f"{formatar_data_hora(item['data_hora'])} - "
+                        f"{item['usuario']} - "
+                        f"{item.get('arquivo_documentos') or item.get('arquivo_base') or 'sem arquivo'}"
+                    ),
+                    key="importacao_para_restaurar",
+                )
+                st.caption(
+                    f"Snapshot anterior: {selecionada['registros_backup']} registro(s). "
+                    "Se o snapshot tiver 0 registros, o banco voltara para vazio antes "
+                    "daquela importacao."
+                )
+                usuario_reversao = st.text_input(
+                    "Usuario responsavel pela restauracao",
+                    key="usuario_reversao",
+                )
+                confirma_reversao = st.text_input(
+                    f"Para confirmar, digite {COMANDO_RESTAURAR}",
+                    key="confirma_reversao",
+                )
+                if st.button("Restaurar estado anterior", key="btn_restaurar_backup"):
+                    if not usuario_reversao.strip():
+                        st.error("Informe o usuario responsavel pela restauracao.")
+                    elif confirma_reversao.strip().upper() != COMANDO_RESTAURAR:
+                        st.error(f"Digite exatamente {COMANDO_RESTAURAR} para confirmar.")
+                    else:
+                        try:
+                            resultado_reversao = restaurar_backup_importacao(
+                                int(selecionada["importacao_id"]), usuario_reversao
+                            )
+                            st.session_state.mensagem_seguranca = (
+                                f"Importacao {resultado_reversao['importacao_id']} "
+                                f"desfeita. O banco saiu de "
+                                f"{resultado_reversao['registros_antes']} registro(s) "
+                                f"ativos para "
+                                f"{resultado_reversao['registros_restaurados']} "
+                                "registro(s) restaurado(s)."
+                            )
+                            st.rerun()
+                        except Exception as erro:
+                            st.error(f"Nao foi possivel restaurar: {erro}")
+
+        with tab_base:
+            backup_base, metadata_backup_base = carregar_ultimo_backup_base()
+            if metadata_backup_base is None:
+                st.info("Ainda nao ha backup anterior da base de composicoes.")
+            else:
+                st.caption(
+                    f"Ultima base em backup: {metadata_backup_base['nome_arquivo']} - "
+                    f"{metadata_backup_base['total_linhas']} linhas - backup criado em "
+                    f"{formatar_data_hora(metadata_backup_base['backup_em'])}."
+                )
+                usuario_base = st.text_input(
+                    "Usuario responsavel pela restauracao da base",
+                    key="usuario_restaurar_base",
+                )
+                confirma_base = st.text_input(
+                    f"Para confirmar, digite {COMANDO_RESTAURAR_BASE}",
+                    key="confirma_restaurar_base",
+                )
+                if st.button("Restaurar ultima base em backup", key="btn_restaurar_base"):
+                    if not usuario_base.strip():
+                        st.error("Informe o usuario responsavel pela restauracao.")
+                    elif confirma_base.strip().upper() != COMANDO_RESTAURAR_BASE:
+                        st.error(
+                            f"Digite exatamente {COMANDO_RESTAURAR_BASE} para confirmar."
+                        )
+                    else:
+                        try:
+                            resultado_base = restaurar_ultimo_backup_base_composicoes(
+                                usuario_base
+                            )
+                            st.session_state.mensagem_seguranca = (
+                                "Base de composicoes restaurada: "
+                                f"{resultado_base['nome_arquivo']} - "
+                                f"{resultado_base['total_linhas']} linhas - "
+                                f"{resultado_base['vinculos_atualizados']} vinculo(s) "
+                                "de documento atualizados."
+                            )
+                            st.rerun()
+                        except Exception as erro:
+                            st.error(f"Nao foi possivel restaurar a base: {erro}")
+
+        with tab_zerar:
+            st.error(
+                "Atencao: esta acao apaga documentos, historicos, backups, "
+                "importacoes e a base de composicoes salva."
+            )
+            usuario_zerar = st.text_input(
+                "Usuario responsavel pela zeragem", key="usuario_zerar_banco"
+            )
+            confirma_zerar = st.text_input(
+                f"Para confirmar, digite {COMANDO_ZERAR_BANCO}",
+                key="confirma_zerar_banco",
+            )
+            if st.button("Zerar banco de dados", key="btn_zerar_banco"):
+                if not usuario_zerar.strip():
+                    st.error("Informe o usuario responsavel pela zeragem.")
+                elif confirma_zerar.strip().upper() != COMANDO_ZERAR_BANCO:
+                    st.error(f"Digite exatamente {COMANDO_ZERAR_BANCO} para confirmar.")
+                else:
+                    try:
+                        resultado_zeragem = zerar_banco_dados(usuario_zerar)
+                        st.session_state.filtro_card = "TODOS"
+                        st.session_state.mensagem_seguranca = (
+                            "Banco zerado com sucesso. Foram apagados "
+                            f"{resultado_zeragem['documentos']} documento(s), "
+                            f"{resultado_zeragem['importacoes']} importacao(oes) "
+                            f"e {resultado_zeragem['bases']} base(s) ativa(s)."
+                        )
+                        st.rerun()
+                    except Exception as erro:
+                        st.error(f"Nao foi possivel zerar o banco: {erro}")
+
     if metadata_base is None:
         st.warning(
             "Nenhuma base de composições encontrada. Importe a base inicial para iniciar "

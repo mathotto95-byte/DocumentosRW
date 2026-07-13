@@ -1,4 +1,5 @@
 import base64
+import html
 import re
 import sqlite3
 import unicodedata
@@ -1744,44 +1745,258 @@ def estilizar_tabela_vencimentos_proximos(df: pd.DataFrame):
     )
 
 
-def mostrar_painel_vencimentos_proximos(documentos_banco: pd.DataFrame) -> None:
-    configurar_recarga_diaria()
+def montar_html_painel_vencimentos_proximos(tabela: pd.DataFrame) -> str:
     logo_uri = logo_data_uri()
     logo_html = (
         f'<img class="logo-tv" src="{logo_uri}" alt="Logo DocumentosRW">'
         if logo_uri else ""
     )
+    if tabela.empty:
+        corpo_tabela = (
+            '<div class="mensagem-vazia">'
+            "Nenhum documento com vencimento nos pr&oacute;ximos 30 dias."
+            "</div>"
+        )
+    else:
+        cabecalho = "".join(
+            f"<th>{html.escape(str(coluna))}</th>" for coluna in tabela.columns
+        )
+        linhas = []
+        for _, row in tabela.iterrows():
+            celulas = "".join(
+                f"<td>{html.escape(str(row[coluna]))}</td>"
+                for coluna in tabela.columns
+            )
+            linhas.append(f"<tr>{celulas}</tr>")
+        corpo_tabela = (
+            '<div class="tabela-tv-wrap">'
+            '<table class="tabela-tv">'
+            f"<thead><tr>{cabecalho}</tr></thead>"
+            f"<tbody>{''.join(linhas)}</tbody>"
+            "</table>"
+            "</div>"
+        )
 
-    st.markdown(
-        f"""
-        <div class="painel-tv">
-            {logo_html}
-            <div class="titulo-tv">VENCIMENTOS PR&Oacute;XIMOS</div>
-            <div class="subtitulo-tv">
-                Documentos com vencimento entre hoje e os pr&oacute;ximos 30 dias
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    return f"""
+    <!doctype html>
+    <html lang="pt-BR">
+    <head>
+        <meta charset="utf-8">
+        <style>
+            :root {{
+                --cabecalho: {COR_CABECALHO};
+                --texto: {COR_TEXTO};
+            }}
+            * {{ box-sizing: border-box; }}
+            html, body {{
+                margin: 0;
+                padding: 0;
+                background: transparent;
+                color: var(--texto);
+                font-family: "Source Sans Pro", Arial, sans-serif;
+                overflow: hidden;
+            }}
+            .painel-tv-fullscreen {{
+                position: relative;
+                width: 100%;
+                min-height: 100%;
+                color: var(--texto);
+                border: 2px solid var(--cabecalho);
+                border-radius: 18px;
+                padding: 2.15rem 1.25rem 1.8rem;
+                overflow: hidden;
+            }}
+            .botao-fullscreen {{
+                position: absolute;
+                top: .85rem;
+                right: .9rem;
+                z-index: 5;
+                border: 1px solid var(--cabecalho);
+                border-radius: 999px;
+                background: transparent;
+                color: var(--texto);
+                cursor: pointer;
+                font-weight: 800;
+                font-size: .95rem;
+                padding: .45rem .85rem;
+            }}
+            .cabecalho-tv {{
+                text-align: center;
+                padding-top: .2rem;
+            }}
+            .logo-tv {{
+                display: block;
+                max-width: 360px;
+                width: min(36vw, 360px);
+                height: auto;
+                margin: 0 auto 1.3rem;
+            }}
+            .titulo-tv {{
+                color: var(--texto);
+                font-size: 3rem;
+                line-height: 1.05;
+                font-weight: 950;
+                letter-spacing: .08em;
+                margin: .35rem 0 0;
+                padding-top: .15rem;
+            }}
+            .subtitulo-tv {{
+                color: var(--texto);
+                font-size: 1.2rem;
+                font-weight: 700;
+                margin-top: .45rem;
+            }}
+            .tabela-tv-wrap {{
+                width: 100%;
+                max-height: 560px;
+                margin-top: 1.2rem;
+                overflow-y: auto;
+                overflow-x: hidden;
+                border: 1px solid #D8C98D;
+                border-radius: 12px;
+            }}
+            .tabela-tv {{
+                width: 100%;
+                border-collapse: collapse;
+                table-layout: fixed;
+            }}
+            .tabela-tv th {{
+                position: sticky;
+                top: 0;
+                z-index: 2;
+                background-color: var(--cabecalho);
+                color: var(--texto);
+                font-size: 19px;
+                font-weight: 800;
+                text-align: center;
+                padding: 12px 10px;
+            }}
+            .tabela-tv td {{
+                color: var(--texto);
+                font-size: 20px;
+                padding: 12px 10px;
+                border-bottom: 1px solid #D8C98D;
+                overflow-wrap: anywhere;
+                vertical-align: middle;
+            }}
+            .tabela-tv td:nth-child(3),
+            .tabela-tv td:nth-child(4) {{
+                text-align: center;
+                font-weight: 800;
+            }}
+            .mensagem-vazia {{
+                margin-top: 1.2rem;
+                border: 1px solid #D8C98D;
+                border-radius: 12px;
+                padding: 1.1rem;
+                text-align: center;
+                font-size: 1.25rem;
+                font-weight: 800;
+            }}
+            .painel-tv-fullscreen:fullscreen {{
+                width: 100vw;
+                height: 100vh;
+                border-radius: 0;
+                padding: clamp(2rem, 4vh, 4rem) clamp(1.4rem, 3vw, 4rem);
+                display: flex;
+                flex-direction: column;
+            }}
+            .painel-tv-fullscreen:fullscreen .cabecalho-tv {{
+                flex: 0 0 auto;
+            }}
+            .painel-tv-fullscreen:fullscreen .logo-tv {{
+                width: min(34vw, 500px);
+                max-width: 500px;
+                margin-bottom: clamp(1rem, 2vh, 2rem);
+            }}
+            .painel-tv-fullscreen:fullscreen .titulo-tv {{
+                font-size: clamp(3.2rem, 6vw, 6.5rem);
+            }}
+            .painel-tv-fullscreen:fullscreen .subtitulo-tv {{
+                font-size: clamp(1.25rem, 2vw, 2.1rem);
+            }}
+            .painel-tv-fullscreen:fullscreen .tabela-tv-wrap {{
+                flex: 1 1 auto;
+                min-height: 0;
+                max-height: none;
+                margin-top: clamp(1rem, 2.5vh, 2rem);
+            }}
+            .painel-tv-fullscreen:fullscreen .tabela-tv th {{
+                font-size: clamp(1.35rem, 2vw, 2.4rem);
+                padding: clamp(.8rem, 1.5vh, 1.4rem);
+            }}
+            .painel-tv-fullscreen:fullscreen .tabela-tv td {{
+                font-size: clamp(1.25rem, 1.8vw, 2.15rem);
+                padding: clamp(.75rem, 1.4vh, 1.35rem);
+            }}
+            .painel-tv-fullscreen:fullscreen .botao-fullscreen {{
+                top: 1.2rem;
+                right: 1.4rem;
+                font-size: clamp(1rem, 1.4vw, 1.45rem);
+            }}
+        </style>
+    </head>
+    <body>
+        <section id="painel-vencimentos-proximos" class="painel-tv-fullscreen">
+            <button id="botao-fullscreen" class="botao-fullscreen" type="button">
+                Tela cheia
+            </button>
+            <header class="cabecalho-tv">
+                {logo_html}
+                <div class="titulo-tv">VENCIMENTOS PR&Oacute;XIMOS</div>
+                <div class="subtitulo-tv">
+                    Documentos com vencimento entre hoje e os pr&oacute;ximos 30 dias
+                </div>
+            </header>
+            {corpo_tabela}
+        </section>
+        <script>
+            const painel = document.getElementById("painel-vencimentos-proximos");
+            const botao = document.getElementById("botao-fullscreen");
+            if (window.frameElement) {{
+                window.frameElement.setAttribute("allowfullscreen", "true");
+                window.frameElement.setAttribute("allow", "fullscreen");
+            }}
 
+            function fullscreenAtivo() {{
+                return document.fullscreenElement === painel;
+            }}
+
+            function atualizarBotao() {{
+                botao.textContent = fullscreenAtivo()
+                    ? "Sair da tela cheia"
+                    : "Tela cheia";
+            }}
+
+            botao.addEventListener("click", async () => {{
+                try {{
+                    if (fullscreenAtivo()) {{
+                        await document.exitFullscreen();
+                    }} else {{
+                        await painel.requestFullscreen();
+                    }}
+                }} catch (erro) {{
+                    console.error("Nao foi possivel alternar tela cheia", erro);
+                }}
+            }});
+
+            document.addEventListener("fullscreenchange", atualizarBotao);
+            atualizarBotao();
+        </script>
+    </body>
+    </html>
+    """
+
+
+def mostrar_painel_vencimentos_proximos(documentos_banco: pd.DataFrame) -> None:
+    configurar_recarga_diaria()
     proximos = buscar_vencimentos_proximos(documentos_banco, date.today(), 30)
-    if proximos.empty:
-        st.info("Nenhum documento com vencimento nos prÃ³ximos 30 dias.")
-        return
-
     tabela = preparar_vencimentos_proximos_tv(proximos)
-    st.dataframe(
-        estilizar_tabela_vencimentos_proximos(tabela),
-        use_container_width=True,
-        hide_index=True,
-        height=min(720, 95 + len(tabela) * 48),
-        column_config={
-            "Tipo do documento": st.column_config.TextColumn(width="medium"),
-            "Placas da composiÃ§Ã£o": st.column_config.TextColumn(width="large"),
-            "Data de vencimento": st.column_config.TextColumn(width="medium"),
-            "Dias para vencer": st.column_config.TextColumn(width="medium"),
-        },
+    altura = min(820, 245 + max(len(tabela), 1) * 54)
+    components.html(
+        montar_html_painel_vencimentos_proximos(tabela),
+        height=altura,
+        scrolling=False,
     )
 
 

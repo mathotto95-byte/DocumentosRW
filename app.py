@@ -1734,7 +1734,6 @@ def estilizar_tabela_vencimentos_proximos(df: pd.DataFrame):
             subset=["Dias para vencer"],
             **{
                 "font-weight": "900",
-                "background-color": "#FFF3C2",
                 "text-align": "center",
             },
         )
@@ -1875,7 +1874,6 @@ st.markdown(
     .painel-tv {{
         text-align: center; margin: 1.4rem 0 1.35rem; padding: 2.15rem 1.25rem 1.8rem;
         border-radius: 18px; border: 2px solid var(--cabecalho);
-        background: linear-gradient(180deg, #FFFDF5 0%, #FFF8DF 100%);
         overflow: visible;
     }}
     .logo-tv {{

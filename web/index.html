@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VENCIMENTOS PRÓXIMOS</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main id="painel-vencimentos-proximos" class="painel-tv">
+    <button id="botao-fullscreen" class="botao-fullscreen" type="button">
+      Tela cheia
+    </button>
+
+    <header class="cabecalho-tv">
+      <img class="logo-tv" src="assets/logo.png" alt="Logo DocumentosRW">
+      <h1>VENCIMENTOS PRÓXIMOS</h1>
+      <p>Documentos com vencimento entre hoje e os próximos 30 dias</p>
+      <span id="ultima-atualizacao" class="ultima-atualizacao">
+        Carregando dados...
+      </span>
+    </header>
+
+    <section class="tabela-tv-wrap" aria-live="polite">
+      <table class="tabela-tv">
+        <thead>
+          <tr>
+            <th>Tipo do documento</th>
+            <th>Placas da composição</th>
+            <th>Vencimento</th>
+            <th>Dias a vencer</th>
+          </tr>
+        </thead>
+        <tbody id="corpo-vencimentos"></tbody>
+      </table>
+      <div id="mensagem-painel" class="mensagem-painel" hidden></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

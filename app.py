@@ -1,6 +1,8 @@
 import base64
 import html
+import json
 import re
+import shutil
 import sqlite3
 import unicodedata
 from datetime import date, datetime, timedelta
@@ -20,6 +22,11 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "painel_vencimentos.db"
 ASSETS_DIR = APP_DIR / "assets"
+WEB_DIR = APP_DIR / "web"
+WEB_ASSETS_DIR = WEB_DIR / "assets"
+WEB_DATA_DIR = WEB_DIR / "data"
+WEB_JSON_PATH = WEB_DATA_DIR / "vencimentos_proximos.json"
+WEB_LOGO_PATH = WEB_ASSETS_DIR / "logo.png"
 
 COR_CABECALHO = "#020D3F"
 COR_TEXTO = "#B5911B"
@@ -229,11 +236,9 @@ def formatar_data_hora(valor) -> str:
 
 
 def texto_dias_restantes(dias: int) -> str:
-    if dias == 0:
-        return "Vence hoje"
     if dias == 1:
-        return "Vence amanhÃ£"
-    return f"Vence em {dias} dias"
+        return "1 dia"
+    return f"{dias} dias"
 
 
 def localizar_logo() -> Path | None:
@@ -1460,21 +1465,73 @@ def preparar_vencimentos_proximos_tv(df: pd.DataFrame) -> pd.DataFrame:
     colunas = [
         "Tipo do documento",
         "Placas da composiÃ§Ã£o",
-        "Data de vencimento",
-        "Dias para vencer",
+        "Vencimento",
+        "Dias a vencer",
     ]
     if df.empty:
         return pd.DataFrame(columns=colunas)
     saida = df.copy()
-    saida["Data de vencimento"] = saida["data_vencimento"].dt.strftime("%d/%m/%Y")
+    saida["Vencimento"] = saida["data_vencimento"].dt.strftime("%d/%m/%Y")
     saida = saida.rename(
         columns={
             "tipo_documento": "Tipo do documento",
             "placa_ou_composicao": "Placas da composiÃ§Ã£o",
-            "texto_dias_restantes": "Dias para vencer",
+            "texto_dias_restantes": "Dias a vencer",
         }
     )
     return saida[colunas]
+
+
+def sincronizar_logo_web() -> None:
+    WEB_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    logo = localizar_logo()
+    if logo and logo.exists():
+        if not WEB_LOGO_PATH.exists() or logo.read_bytes() != WEB_LOGO_PATH.read_bytes():
+            shutil.copy2(logo, WEB_LOGO_PATH)
+
+
+def exportar_vencimentos_proximos_json(
+    data_atual: date | None = None,
+) -> dict:
+    WEB_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    sincronizar_logo_web()
+    documentos = carregar_documentos()
+    proximos = buscar_vencimentos_proximos(documentos, data_atual or date.today(), 30)
+    registros = []
+    for item in proximos.itertuples(index=False):
+        registros.append(
+            {
+                "tipo_documento": item.tipo_documento,
+                "placas_composicao": item.placa_ou_composicao,
+                "data_vencimento": item.data_vencimento.strftime("%d/%m/%Y"),
+                "dias_restantes": int(item.dias_restantes),
+                "texto_dias_restantes": item.texto_dias_restantes,
+            }
+        )
+
+    payload = {
+        "atualizado_em": agora_local().isoformat(timespec="seconds"),
+        "janela_dias": 30,
+        "registros": registros,
+    }
+    WEB_JSON_PATH.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return payload
+
+
+def garantir_exportacao_web_diaria() -> None:
+    precisa_exportar = not WEB_JSON_PATH.exists()
+    if not precisa_exportar:
+        try:
+            payload = json.loads(WEB_JSON_PATH.read_text(encoding="utf-8"))
+            atualizado_em = datetime.fromisoformat(str(payload.get("atualizado_em", "")))
+            precisa_exportar = atualizado_em.date() < agora_local().date()
+        except Exception:
+            precisa_exportar = True
+    if precisa_exportar:
+        exportar_vencimentos_proximos_json()
 
 
 def aplicar_filtros(
@@ -2125,6 +2182,7 @@ st.markdown(
 
 def main() -> None:
     inicializar_banco()
+    garantir_exportacao_web_diaria()
     st.markdown(
         '<div class="titulo">Painel de vencimentos por composição</div>',
         unsafe_allow_html=True,
@@ -2236,6 +2294,7 @@ def main() -> None:
                                 nome_base,
                                 arquivo_documentos.name if arquivo_documentos else "",
                             )
+                        exportacao_web = exportar_vencimentos_proximos_json()
 
                     mensagens = []
                     if resultado_base:
@@ -2250,6 +2309,9 @@ def main() -> None:
                             f"{resultado['ignorados']} ignorados"
                         )
                     st.success(" · ".join(mensagens) + ".")
+                    mensagens.append(
+                        f"JSON Web atualizado ({len(exportacao_web['registros'])} registro(s))"
+                    )
                 except Exception as erro:
                     st.error(f"Não foi possível importar: {erro}")
 
@@ -2307,6 +2369,7 @@ def main() -> None:
                             resultado_reversao = restaurar_backup_importacao(
                                 int(selecionada["importacao_id"]), usuario_reversao
                             )
+                            exportar_vencimentos_proximos_json()
                             st.session_state.mensagem_seguranca = (
                                 f"Importacao {resultado_reversao['importacao_id']} "
                                 f"desfeita. O banco saiu de "
@@ -2349,6 +2412,7 @@ def main() -> None:
                             resultado_base = restaurar_ultimo_backup_base_composicoes(
                                 usuario_base
                             )
+                            exportar_vencimentos_proximos_json()
                             st.session_state.mensagem_seguranca = (
                                 "Base de composicoes restaurada: "
                                 f"{resultado_base['nome_arquivo']} - "
@@ -2380,6 +2444,7 @@ def main() -> None:
                 else:
                     try:
                         resultado_zeragem = zerar_banco_dados(usuario_zerar)
+                        exportar_vencimentos_proximos_json()
                         st.session_state.filtro_card = "TODOS"
                         st.session_state.mensagem_seguranca = (
                             "Banco zerado com sucesso. Foram apagados "

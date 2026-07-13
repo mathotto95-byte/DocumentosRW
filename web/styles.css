@@ -1,0 +1,202 @@
+:root {
+  --cabecalho: #020D3F;
+  --texto: #B5911B;
+  --borda: #D8C98D;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  color: var(--texto);
+  font-family: "Source Sans Pro", Arial, sans-serif;
+  padding: 2.6rem clamp(1rem, 2.5vw, 2rem);
+  overflow: hidden;
+}
+
+.painel-tv {
+  position: relative;
+  width: min(1550px, 100%);
+  height: calc(100vh - 5.2rem);
+  margin: 0 auto;
+  color: var(--texto);
+  border: 2px solid var(--cabecalho);
+  border-radius: 18px;
+  padding: 2.15rem 1.25rem 1.8rem;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.botao-fullscreen {
+  position: absolute;
+  top: .85rem;
+  right: .9rem;
+  z-index: 5;
+  border: 1px solid var(--cabecalho);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--texto);
+  cursor: pointer;
+  font-weight: 800;
+  font-size: .95rem;
+  padding: .45rem .85rem;
+}
+
+.cabecalho-tv {
+  flex: 0 0 auto;
+  text-align: center;
+  padding-top: .2rem;
+}
+
+.logo-tv {
+  display: block;
+  max-width: 360px;
+  width: min(36vw, 360px);
+  height: auto;
+  margin: 0 auto 1.3rem;
+}
+
+.cabecalho-tv h1 {
+  color: var(--texto);
+  font-size: 3rem;
+  line-height: 1.05;
+  font-weight: 950;
+  letter-spacing: .08em;
+  margin: .35rem 0 0;
+  padding-top: .15rem;
+}
+
+.cabecalho-tv p {
+  color: var(--texto);
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin: .45rem 0 0;
+}
+
+.ultima-atualizacao {
+  display: block;
+  margin-top: .4rem;
+  font-size: .98rem;
+  font-weight: 700;
+}
+
+.tabela-tv-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  margin-top: 1.2rem;
+  overflow-y: auto;
+  overflow-x: hidden;
+  border: 1px solid var(--borda);
+  border-radius: 12px;
+}
+
+.tabela-tv {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.tabela-tv th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background-color: var(--cabecalho);
+  color: var(--texto);
+  font-size: 19px;
+  font-weight: 800;
+  text-align: center;
+  padding: 12px 10px;
+}
+
+.tabela-tv td {
+  color: var(--texto);
+  font-size: 20px;
+  padding: 12px 10px;
+  border-bottom: 1px solid var(--borda);
+  overflow-wrap: anywhere;
+  vertical-align: middle;
+}
+
+.tabela-tv td:nth-child(3),
+.tabela-tv td:nth-child(4) {
+  text-align: center;
+  font-weight: 800;
+}
+
+.mensagem-painel {
+  margin: 1.2rem;
+  border: 1px solid var(--borda);
+  border-radius: 12px;
+  padding: 1.1rem;
+  text-align: center;
+  font-size: 1.25rem;
+  font-weight: 800;
+}
+
+.painel-tv:fullscreen {
+  width: 100vw;
+  height: 100vh;
+  border-radius: 0;
+  padding: clamp(2rem, 4vh, 4rem) clamp(1.4rem, 3vw, 4rem);
+}
+
+.painel-tv:fullscreen .logo-tv {
+  width: min(34vw, 500px);
+  max-width: 500px;
+  margin-bottom: clamp(1rem, 2vh, 2rem);
+}
+
+.painel-tv:fullscreen h1 {
+  font-size: clamp(3.2rem, 6vw, 6.5rem);
+}
+
+.painel-tv:fullscreen .cabecalho-tv p {
+  font-size: clamp(1.25rem, 2vw, 2.1rem);
+}
+
+.painel-tv:fullscreen .tabela-tv th {
+  font-size: clamp(1.35rem, 2vw, 2.4rem);
+  padding: clamp(.8rem, 1.5vh, 1.4rem);
+}
+
+.painel-tv:fullscreen .tabela-tv td {
+  font-size: clamp(1.25rem, 1.8vw, 2.15rem);
+  padding: clamp(.75rem, 1.4vh, 1.35rem);
+}
+
+.painel-tv:fullscreen .botao-fullscreen {
+  top: 1.2rem;
+  right: 1.4rem;
+  font-size: clamp(1rem, 1.4vw, 1.45rem);
+}
+
+@media (max-width: 760px) {
+  body {
+    padding: 1rem;
+  }
+
+  .painel-tv {
+    height: calc(100vh - 2rem);
+    padding: 4rem .75rem 1rem;
+  }
+
+  .cabecalho-tv h1 {
+    font-size: 2rem;
+  }
+
+  .tabela-tv th,
+  .tabela-tv td {
+    font-size: .95rem;
+    padding: .65rem .45rem;
+  }
+}

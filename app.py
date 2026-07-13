@@ -1,3 +1,4 @@
+import base64
 import re
 import sqlite3
 import unicodedata
@@ -240,6 +241,20 @@ def localizar_logo() -> Path | None:
         if caminho.exists():
             return caminho
     return None
+
+
+def logo_data_uri() -> str:
+    caminho = localizar_logo()
+    if not caminho:
+        return ""
+    mime = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+    }.get(caminho.suffix.lower(), "image/png")
+    conteudo = base64.b64encode(caminho.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{conteudo}"
 
 
 def milissegundos_ate_proxima_atualizacao() -> int:
@@ -1407,14 +1422,9 @@ def buscar_vencimentos_proximos(
     if dados.empty:
         return pd.DataFrame(columns=colunas)
 
-    documentos_por_composicao = {"AETs", "AFERIÇÃO", "AGENDAMENTO AFERIÇÃO"}
-    dados["placa_ou_composicao"] = dados["placa"].astype(str)
-    usar_composicao = dados["documento"].isin(documentos_por_composicao)
-    dados.loc[usar_composicao, "placa_ou_composicao"] = dados.loc[
-        usar_composicao, "composicao"
-    ].where(
-        dados.loc[usar_composicao, "composicao"].astype(str).str.strip().ne(""),
-        dados.loc[usar_composicao, "placa"],
+    dados["placa_ou_composicao"] = dados["composicao"].where(
+        dados["composicao"].astype(str).str.strip().ne(""),
+        dados["placa"],
     )
     dados["tipo_documento"] = dados["documento"]
     dados["texto_dias_restantes"] = dados["dias_restantes"].astype(int).apply(
@@ -1448,7 +1458,7 @@ def buscar_vencimentos_proximos(
 def preparar_vencimentos_proximos_tv(df: pd.DataFrame) -> pd.DataFrame:
     colunas = [
         "Tipo do documento",
-        "Placa ou composiÃ§Ã£o",
+        "Placas da composiÃ§Ã£o",
         "Data de vencimento",
         "Dias para vencer",
     ]
@@ -1459,7 +1469,7 @@ def preparar_vencimentos_proximos_tv(df: pd.DataFrame) -> pd.DataFrame:
     saida = saida.rename(
         columns={
             "tipo_documento": "Tipo do documento",
-            "placa_ou_composicao": "Placa ou composiÃ§Ã£o",
+            "placa_ou_composicao": "Placas da composiÃ§Ã£o",
             "texto_dias_restantes": "Dias para vencer",
         }
     )
@@ -1737,18 +1747,19 @@ def estilizar_tabela_vencimentos_proximos(df: pd.DataFrame):
 
 def mostrar_painel_vencimentos_proximos(documentos_banco: pd.DataFrame) -> None:
     configurar_recarga_diaria()
-    logo = localizar_logo()
-    if logo:
-        c1, c2, c3 = st.columns([1, 1.15, 1])
-        with c2:
-            st.image(str(logo), use_container_width=True)
+    logo_uri = logo_data_uri()
+    logo_html = (
+        f'<img class="logo-tv" src="{logo_uri}" alt="Logo DocumentosRW">'
+        if logo_uri else ""
+    )
 
     st.markdown(
-        """
+        f"""
         <div class="painel-tv">
-            <div class="titulo-tv">VENCIMENTOS PRÃ“XIMOS</div>
+            {logo_html}
+            <div class="titulo-tv">VENCIMENTOS PR&Oacute;XIMOS</div>
             <div class="subtitulo-tv">
-                Documentos com vencimento entre hoje e os prÃ³ximos 30 dias
+                Documentos com vencimento entre hoje e os pr&oacute;ximos 30 dias
             </div>
         </div>
         """,
@@ -1768,7 +1779,7 @@ def mostrar_painel_vencimentos_proximos(documentos_banco: pd.DataFrame) -> None:
         height=min(720, 95 + len(tabela) * 48),
         column_config={
             "Tipo do documento": st.column_config.TextColumn(width="medium"),
-            "Placa ou composiÃ§Ã£o": st.column_config.TextColumn(width="large"),
+            "Placas da composiÃ§Ã£o": st.column_config.TextColumn(width="large"),
             "Data de vencimento": st.column_config.TextColumn(width="medium"),
             "Dias para vencer": st.column_config.TextColumn(width="medium"),
         },
@@ -1855,20 +1866,26 @@ st.markdown(
     <style>
     :root {{ --cabecalho: {COR_CABECALHO}; --texto: {COR_TEXTO}; }}
     .stApp {{ color: var(--texto); }}
-    .block-container {{ padding-top: 1.2rem; max-width: 1550px; }}
+    .block-container {{ padding-top: 2.6rem; max-width: 1550px; }}
     h1, h2, h3, label, p {{ color: var(--texto); }}
     .titulo {{ font-size: 2.15rem; font-weight: 850; color: var(--texto); }}
     .subtitulo {{ color: #4B536F; margin: 0.1rem 0 1rem; }}
     .faixa {{ background: var(--cabecalho); color: var(--texto); padding: .75rem 1rem;
               border-radius: 12px; font-weight: 800; margin: .7rem 0; }}
     .painel-tv {{
-        text-align: center; margin: 1rem 0 1.1rem; padding: 1rem .75rem;
+        text-align: center; margin: 1.4rem 0 1.35rem; padding: 2.15rem 1.25rem 1.8rem;
         border-radius: 18px; border: 2px solid var(--cabecalho);
         background: linear-gradient(180deg, #FFFDF5 0%, #FFF8DF 100%);
+        overflow: visible;
+    }}
+    .logo-tv {{
+        display: block; max-width: 360px; width: min(36vw, 360px);
+        height: auto; margin: 0 auto 1.3rem;
     }}
     .titulo-tv {{
         color: var(--texto); font-size: 3rem; line-height: 1.05;
-        font-weight: 950; letter-spacing: .08em;
+        font-weight: 950; letter-spacing: .08em; margin-top: .35rem;
+        padding-top: .15rem;
     }}
     .subtitulo-tv {{
         color: var(--texto); font-size: 1.2rem; font-weight: 700;

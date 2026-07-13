@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 
 # =========================================================
@@ -16,6 +17,7 @@ import streamlit as st
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DB_PATH = DATA_DIR / "painel_vencimentos.db"
+ASSETS_DIR = APP_DIR / "assets"
 
 COR_CABECALHO = "#020D3F"
 COR_TEXTO = "#B5911B"
@@ -45,6 +47,15 @@ COMANDO_RESTAURAR = "RESTAURAR"
 COMANDO_RESTAURAR_BASE = "RESTAURAR BASE"
 COMANDO_ZERAR_BANCO = "ZERAR BANCO"
 COLUNAS_MINIMAS_BASE = 8
+DOCUMENTOS_VENCIMENTOS_PROXIMOS = {
+    "CIV",
+    "CIPP",
+    "CRLV",
+    "AETs",
+    "CRONOTACÓGRAFO",
+    "AFERIÇÃO",
+    "AGENDAMENTO AFERIÇÃO",
+}
 
 
 # =========================================================
@@ -213,6 +224,48 @@ def formatar_data_hora(valor) -> str:
         if pd.isna(convertido):
             return ""
     return convertido.strftime("%d/%m/%Y %H:%M:%S")
+
+
+def texto_dias_restantes(dias: int) -> str:
+    if dias == 0:
+        return "Vence hoje"
+    if dias == 1:
+        return "Vence amanhÃ£"
+    return f"Vence em {dias} dias"
+
+
+def localizar_logo() -> Path | None:
+    for nome_arquivo in ["logo.png", "logo.jpg", "logo.jpeg", "logo.webp"]:
+        caminho = ASSETS_DIR / nome_arquivo
+        if caminho.exists():
+            return caminho
+    return None
+
+
+def milissegundos_ate_proxima_atualizacao() -> int:
+    agora = agora_local()
+    proxima = datetime.combine(
+        agora.date() + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=agora.tzinfo,
+    ) + timedelta(minutes=5)
+    return max(int((proxima - agora).total_seconds() * 1000), 60_000)
+
+
+def configurar_recarga_diaria() -> None:
+    intervalo_ms = milissegundos_ate_proxima_atualizacao()
+    components.html(
+        f"""
+        <script>
+        const atraso = {intervalo_ms};
+        window.setTimeout(() => {{
+            window.parent.location.reload();
+        }}, atraso);
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
 
 
 def criar_nomes_unicos(colunas) -> list[str]:
@@ -1324,6 +1377,95 @@ def enriquecer_status(df: pd.DataFrame, data_referencia: date) -> pd.DataFrame:
     ).drop(columns="_ordem_status")
 
 
+def buscar_vencimentos_proximos(
+    df: pd.DataFrame,
+    data_atual: date | None = None,
+    dias_janela: int = 30,
+) -> pd.DataFrame:
+    colunas = [
+        "tipo_documento",
+        "placa_ou_composicao",
+        "data_vencimento",
+        "dias_restantes",
+        "texto_dias_restantes",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=colunas)
+
+    referencia = pd.Timestamp(data_atual or date.today()).normalize()
+    dados = df[df["documento"].isin(DOCUMENTOS_VENCIMENTOS_PROXIMOS)].copy()
+    if dados.empty:
+        return pd.DataFrame(columns=colunas)
+
+    dados["data_vencimento"] = pd.to_datetime(dados["vencimento"], errors="coerce")
+    dados = dados[dados["data_vencimento"].notna()]
+    if dados.empty:
+        return pd.DataFrame(columns=colunas)
+
+    dados["dias_restantes"] = (dados["data_vencimento"] - referencia).dt.days
+    dados = dados[dados["dias_restantes"].between(0, dias_janela, inclusive="both")]
+    if dados.empty:
+        return pd.DataFrame(columns=colunas)
+
+    documentos_por_composicao = {"AETs", "AFERIÇÃO", "AGENDAMENTO AFERIÇÃO"}
+    dados["placa_ou_composicao"] = dados["placa"].astype(str)
+    usar_composicao = dados["documento"].isin(documentos_por_composicao)
+    dados.loc[usar_composicao, "placa_ou_composicao"] = dados.loc[
+        usar_composicao, "composicao"
+    ].where(
+        dados.loc[usar_composicao, "composicao"].astype(str).str.strip().ne(""),
+        dados.loc[usar_composicao, "placa"],
+    )
+    dados["tipo_documento"] = dados["documento"]
+    dados["texto_dias_restantes"] = dados["dias_restantes"].astype(int).apply(
+        texto_dias_restantes
+    )
+
+    saida = (
+        dados[
+            [
+                "tipo_documento",
+                "placa_ou_composicao",
+                "data_vencimento",
+                "dias_restantes",
+                "texto_dias_restantes",
+            ]
+        ]
+        .drop_duplicates()
+        .sort_values(
+            [
+                "dias_restantes",
+                "data_vencimento",
+                "tipo_documento",
+                "placa_ou_composicao",
+            ]
+        )
+        .reset_index(drop=True)
+    )
+    return saida[colunas]
+
+
+def preparar_vencimentos_proximos_tv(df: pd.DataFrame) -> pd.DataFrame:
+    colunas = [
+        "Tipo do documento",
+        "Placa ou composiÃ§Ã£o",
+        "Data de vencimento",
+        "Dias para vencer",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=colunas)
+    saida = df.copy()
+    saida["Data de vencimento"] = saida["data_vencimento"].dt.strftime("%d/%m/%Y")
+    saida = saida.rename(
+        columns={
+            "tipo_documento": "Tipo do documento",
+            "placa_ou_composicao": "Placa ou composiÃ§Ã£o",
+            "texto_dias_restantes": "Dias para vencer",
+        }
+    )
+    return saida[colunas]
+
+
 def aplicar_filtros(
     df: pd.DataFrame,
     placa: str,
@@ -1553,6 +1695,86 @@ def painel_status(
     mostrar_ultimos_atualizados(auditoria, dados)
 
 
+def estilizar_tabela_vencimentos_proximos(df: pd.DataFrame):
+    return (
+        df.style
+        .set_table_styles(
+            [
+                {
+                    "selector": "th",
+                    "props": [
+                        ("background-color", COR_CABECALHO),
+                        ("color", COR_TEXTO),
+                        ("font-weight", "800"),
+                        ("font-size", "19px"),
+                        ("text-align", "center"),
+                    ],
+                },
+                {
+                    "selector": "td",
+                    "props": [
+                        ("color", COR_TEXTO),
+                        ("font-size", "20px"),
+                        ("padding", "12px 10px"),
+                    ],
+                },
+            ]
+        )
+        .set_properties(
+            subset=["Dias para vencer"],
+            **{
+                "font-weight": "900",
+                "background-color": "#FFF3C2",
+                "text-align": "center",
+            },
+        )
+        .set_properties(
+            subset=["Data de vencimento"],
+            **{"font-weight": "800", "text-align": "center"},
+        )
+    )
+
+
+def mostrar_painel_vencimentos_proximos(documentos_banco: pd.DataFrame) -> None:
+    configurar_recarga_diaria()
+    logo = localizar_logo()
+    if logo:
+        c1, c2, c3 = st.columns([1, 1.15, 1])
+        with c2:
+            st.image(str(logo), use_container_width=True)
+
+    st.markdown(
+        """
+        <div class="painel-tv">
+            <div class="titulo-tv">VENCIMENTOS PRÃ“XIMOS</div>
+            <div class="subtitulo-tv">
+                Documentos com vencimento entre hoje e os prÃ³ximos 30 dias
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    proximos = buscar_vencimentos_proximos(documentos_banco, date.today(), 30)
+    if proximos.empty:
+        st.info("Nenhum documento com vencimento nos prÃ³ximos 30 dias.")
+        return
+
+    tabela = preparar_vencimentos_proximos_tv(proximos)
+    st.dataframe(
+        estilizar_tabela_vencimentos_proximos(tabela),
+        use_container_width=True,
+        hide_index=True,
+        height=min(720, 95 + len(tabela) * 48),
+        column_config={
+            "Tipo do documento": st.column_config.TextColumn(width="medium"),
+            "Placa ou composiÃ§Ã£o": st.column_config.TextColumn(width="large"),
+            "Data de vencimento": st.column_config.TextColumn(width="medium"),
+            "Dias para vencer": st.column_config.TextColumn(width="medium"),
+        },
+    )
+
+
 def estilizar_tabela(df: pd.DataFrame):
     return df.style.set_table_styles(
         [
@@ -1639,6 +1861,19 @@ st.markdown(
     .subtitulo {{ color: #4B536F; margin: 0.1rem 0 1rem; }}
     .faixa {{ background: var(--cabecalho); color: var(--texto); padding: .75rem 1rem;
               border-radius: 12px; font-weight: 800; margin: .7rem 0; }}
+    .painel-tv {{
+        text-align: center; margin: 1rem 0 1.1rem; padding: 1rem .75rem;
+        border-radius: 18px; border: 2px solid var(--cabecalho);
+        background: linear-gradient(180deg, #FFFDF5 0%, #FFF8DF 100%);
+    }}
+    .titulo-tv {{
+        color: var(--texto); font-size: 3rem; line-height: 1.05;
+        font-weight: 950; letter-spacing: .08em;
+    }}
+    .subtitulo-tv {{
+        color: var(--texto); font-size: 1.2rem; font-weight: 700;
+        margin-top: .45rem;
+    }}
     div[data-testid="stButton"] > button {{
         width: 100%; min-height: 92px; border-radius: 15px;
         border: 1px solid var(--cabecalho); background: #FFFDF5;
@@ -1940,6 +2175,8 @@ def main() -> None:
             "a análise dos vencimentos."
         )
         return
+
+    mostrar_painel_vencimentos_proximos(documentos_banco)
 
     st.markdown('<div class="faixa">Filtros principais</div>', unsafe_allow_html=True)
     f1, f2, f3, f4, f5 = st.columns([1.25, 0.85, 0.85, 1.45, 0.65])

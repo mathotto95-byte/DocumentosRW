@@ -873,6 +873,25 @@ def carregar_documentos() -> pd.DataFrame:
     return df
 
 
+def ultima_atualizacao_banco_documentos() -> str:
+    df = consultar_sql(
+        """
+        SELECT MAX(valor) AS data_hora
+        FROM (
+            SELECT MAX(data_hora) AS valor FROM importacoes
+            UNION ALL
+            SELECT MAX(importado_em) AS valor FROM documentos
+            UNION ALL
+            SELECT MAX(data_hora) AS valor FROM historico_atualizacoes
+        )
+        """
+    )
+    if df.empty:
+        return "Sem atualizacao"
+    data_hora = formatar_data_hora(df.iloc[0].get("data_hora"))
+    return data_hora or "Sem atualizacao"
+
+
 def carregar_importacoes() -> pd.DataFrame:
     return consultar_sql(
         """
@@ -1818,12 +1837,16 @@ def estilizar_tabela_vencimentos_proximos(df: pd.DataFrame):
     )
 
 
-def montar_html_painel_vencimentos_proximos(tabela: pd.DataFrame) -> str:
+def montar_html_painel_vencimentos_proximos(
+    tabela: pd.DataFrame,
+    atualizado_banco: str = "",
+) -> str:
     logo_uri = logo_data_uri()
     logo_html = (
         f'<img class="logo-tv" src="{logo_uri}" alt="Logo DocumentosRW">'
         if logo_uri else ""
     )
+    atualizado_banco = atualizado_banco or "Sem atualizacao"
     if tabela.empty:
         corpo_tabela = (
             '<div class="mensagem-vazia">'
@@ -1918,6 +1941,12 @@ def montar_html_painel_vencimentos_proximos(tabela: pd.DataFrame) -> str:
                 font-size: 1.2rem;
                 font-weight: 700;
                 margin-top: .45rem;
+            }}
+            .atualizacao-banco-tv {{
+                color: var(--texto);
+                font-size: 1.05rem;
+                font-weight: 850;
+                margin-top: .35rem;
             }}
             .tabela-tv-wrap {{
                 width: 100%;
@@ -2020,6 +2049,9 @@ def montar_html_painel_vencimentos_proximos(tabela: pd.DataFrame) -> str:
                 <div class="subtitulo-tv">
                     Documentos com vencimento entre hoje e os pr&oacute;ximos 30 dias
                 </div>
+                <div class="atualizacao-banco-tv">
+                    Atualizacao do banco Documentos: {html.escape(atualizado_banco)}
+                </div>
             </header>
             {corpo_tabela}
         </section>
@@ -2061,13 +2093,19 @@ def montar_html_painel_vencimentos_proximos(tabela: pd.DataFrame) -> str:
     """
 
 
-def mostrar_painel_vencimentos_proximos(documentos_banco: pd.DataFrame) -> None:
+def mostrar_painel_vencimentos_proximos(
+    documentos_banco: pd.DataFrame,
+    atualizado_banco: str = "",
+) -> None:
     configurar_recarga_diaria()
     proximos = buscar_vencimentos_proximos(documentos_banco, date.today(), 30)
     tabela = preparar_vencimentos_proximos_tv(proximos)
     altura = min(820, 245 + max(len(tabela), 1) * 54)
     components.html(
-        montar_html_painel_vencimentos_proximos(tabela),
+        montar_html_painel_vencimentos_proximos(
+            tabela,
+            atualizado_banco or ultima_atualizacao_banco_documentos(),
+        ),
         height=altura,
         scrolling=False,
     )
@@ -2161,11 +2199,18 @@ def render_tv_documentos_coupa() -> None:
     else:
         painel_ativo = "Documentos" if int(time.time() // intervalo) % 2 == 0 else "Coupa"
         recarregar_tv(intervalo)
+    atualizacao_documentos = ultima_atualizacao_banco_documentos()
+    atualizacao_banco = (
+        f"Banco Documentos: {atualizacao_documentos}"
+        if painel_ativo == "Documentos"
+        else "Banco Coupa: horario exibido no painel Coupa"
+    )
     st.markdown(
         f"""
         <div class="tv-topo">
             <div class="tv-titulo">TV Operacional - {html.escape(painel_ativo)}</div>
             <div class="tv-subtitulo">Documentos RW x Resumo Coupa | {agora_local().strftime('%d/%m/%Y %H:%M')}</div>
+            <div class="tv-subtitulo">{html.escape(atualizacao_banco)}</div>
             <div class="tv-admin">Administracao do Documentos: abra este app com ?admin=1</div>
         </div>
         """,
@@ -2182,7 +2227,7 @@ def render_tv_documentos_coupa() -> None:
     if documentos_banco.empty:
         st.warning("Nenhum documento importado. Abra com ?admin=1 para importar a base.")
         return
-    mostrar_painel_vencimentos_proximos(documentos_banco)
+    mostrar_painel_vencimentos_proximos(documentos_banco, atualizacao_documentos)
 
 
 def estilizar_tabela(df: pd.DataFrame):

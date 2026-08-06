@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import sqlite3
+import time
 import unicodedata
 from datetime import date, datetime, timedelta
 from io import BytesIO, StringIO
@@ -30,6 +31,7 @@ WEB_LOGO_PATH = WEB_ASSETS_DIR / "logo.png"
 
 COR_CABECALHO = "#020D3F"
 COR_TEXTO = "#B5911B"
+CONTROLE_TV_COUPA_URL = "https://controle-integrado.streamlit.app/?tv=documentos-coupa&painel=coupa"
 
 TIPOS_DOCUMENTO = [
     "CIV",
@@ -75,6 +77,20 @@ def agora_local() -> datetime:
         return datetime.now(ZoneInfo("America/Sao_Paulo"))
     except Exception:
         return datetime.now().astimezone()
+
+
+def query_param(nome: str, padrao: str = "") -> str:
+    try:
+        valor = st.query_params.get(nome, padrao)
+    except Exception:
+        return padrao
+    if isinstance(valor, list):
+        return str(valor[0] if valor else padrao)
+    return str(valor if valor not in [None, ""] else padrao)
+
+
+def query_ativo(nome: str) -> bool:
+    return query_param(nome).strip().lower() in {"1", "sim", "s", "true", "yes"}
 
 
 def normalizar_texto(valor) -> str:
@@ -2057,6 +2073,118 @@ def mostrar_painel_vencimentos_proximos(documentos_banco: pd.DataFrame) -> None:
     )
 
 
+def recarregar_tv(intervalo_segundos: int) -> None:
+    components.html(
+        f"""
+        <script>
+        setTimeout(function() {{
+            try {{
+                window.parent.location.reload();
+            }} catch (erro) {{
+                window.location.reload();
+            }}
+        }}, {int(intervalo_segundos) * 1000});
+        </script>
+        """,
+        height=0,
+    )
+
+
+def css_tv_documentos_coupa() -> None:
+    st.markdown(
+        """
+        <style>
+        html, body, .stApp {
+            background: #030914 !important;
+            color: #f8fafc !important;
+        }
+        [data-testid="stSidebar"],
+        [data-testid="stToolbar"],
+        [data-testid="stHeader"],
+        [data-testid="stDecoration"],
+        .stDeployButton,
+        #MainMenu,
+        footer {
+            display: none !important;
+        }
+        .block-container {
+            max-width: 100% !important;
+            padding: 0.45rem 0.75rem 0.75rem !important;
+            min-height: 100vh;
+            background: #030914;
+        }
+        .tv-topo {
+            background: #071526;
+            border: 1px solid rgba(181,145,27,0.45);
+            border-radius: 10px;
+            padding: 12px 16px;
+            margin-bottom: 8px;
+        }
+        .tv-titulo {
+            color: #f8fafc;
+            font-size: 30px;
+            font-weight: 900;
+            line-height: 1.05;
+        }
+        .tv-subtitulo {
+            color: rgba(248,250,252,0.76);
+            font-size: 14px;
+            font-weight: 700;
+            margin-top: 4px;
+        }
+        .tv-admin {
+            color: rgba(248,250,252,0.74);
+            font-size: 13px;
+            margin-top: 6px;
+        }
+        iframe {
+            background: #030914 !important;
+            border-radius: 10px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_tv_documentos_coupa() -> None:
+    inicializar_banco()
+    garantir_exportacao_web_diaria()
+    css_tv_documentos_coupa()
+    painel_param = query_param("painel", "auto").strip().lower()
+    intervalo = pd.to_numeric(pd.Series([query_param("tempo", "60")]), errors="coerce").fillna(60).iloc[0]
+    intervalo = max(15, min(600, int(intervalo)))
+    if painel_param in {"documentos", "docs"}:
+        painel_ativo = "Documentos"
+    elif painel_param in {"coupa", "resumo"}:
+        painel_ativo = "Coupa"
+    else:
+        painel_ativo = "Documentos" if int(time.time() // intervalo) % 2 == 0 else "Coupa"
+        recarregar_tv(intervalo)
+    st.markdown(
+        f"""
+        <div class="tv-topo">
+            <div class="tv-titulo">TV Operacional - {html.escape(painel_ativo)}</div>
+            <div class="tv-subtitulo">Documentos RW x Resumo Coupa | {agora_local().strftime('%d/%m/%Y %H:%M')}</div>
+            <div class="tv-admin">Administracao do Documentos: abra este app com ?admin=1</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if painel_ativo == "Coupa":
+        components.iframe(
+            f"{CONTROLE_TV_COUPA_URL}&tempo={intervalo}",
+            height=930,
+            scrolling=True,
+        )
+        return
+    documentos_banco = carregar_documentos()
+    if documentos_banco.empty:
+        st.warning("Nenhum documento importado. Abra com ?admin=1 para importar a base.")
+        return
+    mostrar_painel_vencimentos_proximos(documentos_banco)
+
+
 def estilizar_tabela(df: pd.DataFrame):
     return df.style.set_table_styles(
         [
@@ -2181,6 +2309,9 @@ st.markdown(
 
 
 def main() -> None:
+    if not query_ativo("admin"):
+        render_tv_documentos_coupa()
+        return
     inicializar_banco()
     garantir_exportacao_web_diaria()
     st.markdown(

@@ -1904,8 +1904,8 @@ def montar_html_painel_vencimentos_proximos(
                 background: #030914;
                 color: var(--texto);
                 border: 2px solid var(--cabecalho);
-                border-radius: 18px;
-                padding: 1.35rem 1.25rem 1.15rem;
+                border-radius: 10px;
+                padding: .85rem 1rem .8rem;
                 overflow: hidden;
             }}
             .botao-fullscreen {{
@@ -1929,14 +1929,14 @@ def montar_html_painel_vencimentos_proximos(
             }}
             .logo-tv {{
                 display: block;
-                max-width: 260px;
-                width: min(26vw, 260px);
+                max-width: 210px;
+                width: min(22vw, 210px);
                 height: auto;
-                margin: 0 auto .75rem;
+                margin: 0 auto .45rem;
             }}
             .titulo-tv {{
                 color: var(--texto);
-                font-size: 2.45rem;
+                font-size: 2.15rem;
                 line-height: 1.05;
                 font-weight: 950;
                 letter-spacing: .08em;
@@ -1945,13 +1945,13 @@ def montar_html_painel_vencimentos_proximos(
             }}
             .subtitulo-tv {{
                 color: var(--texto);
-                font-size: 1.2rem;
+                font-size: 1.05rem;
                 font-weight: 700;
                 margin-top: .45rem;
             }}
             .atualizacao-banco-tv {{
                 color: var(--texto);
-                font-size: 1.05rem;
+                font-size: .98rem;
                 font-weight: 850;
                 margin-top: .35rem;
             }}
@@ -1960,7 +1960,7 @@ def montar_html_painel_vencimentos_proximos(
                 min-height: 0;
                 width: 100%;
                 max-height: none;
-                margin-top: .95rem;
+                margin-top: .75rem;
                 overflow-y: auto;
                 overflow-x: hidden;
                 border: 1px solid #D8C98D;
@@ -2204,6 +2204,7 @@ def render_tv_documentos_coupa() -> None:
     garantir_exportacao_web_diaria()
     css_tv_documentos_coupa()
     painel_param = query_param("painel", "auto").strip().lower()
+    embed_tv = query_ativo("embed_tv")
     intervalo = pd.to_numeric(pd.Series([query_param("tempo", "60")]), errors="coerce").fillna(60).iloc[0]
     intervalo = max(15, min(600, int(intervalo)))
     if painel_param in {"documentos", "docs"}:
@@ -2219,17 +2220,18 @@ def render_tv_documentos_coupa() -> None:
         if painel_ativo == "Documentos"
         else "Banco Coupa: horario exibido no painel Coupa"
     )
-    st.markdown(
-        f"""
-        <div class="tv-topo">
-            <div class="tv-titulo">TV Operacional - {html.escape(painel_ativo)}</div>
-            <div class="tv-subtitulo">Documentos RW x Resumo Coupa | {agora_local().strftime('%d/%m/%Y %H:%M')}</div>
-            <div class="tv-subtitulo">{html.escape(atualizacao_banco)}</div>
-            <div class="tv-admin">Administracao do Documentos: abra este app com ?admin=1</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    if not embed_tv:
+        st.markdown(
+            f"""
+            <div class="tv-topo">
+                <div class="tv-titulo">TV Operacional - {html.escape(painel_ativo)}</div>
+                <div class="tv-subtitulo">Documentos RW x Resumo Coupa | {agora_local().strftime('%d/%m/%Y %H:%M')}</div>
+                <div class="tv-subtitulo">{html.escape(atualizacao_banco)}</div>
+                <div class="tv-admin">Administracao do Documentos: abra este app com ?admin=1</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
     if painel_ativo == "Coupa":
         components.iframe(
             f"{CONTROLE_TV_COUPA_URL}&tempo={intervalo}",

@@ -1885,6 +1885,8 @@ def montar_html_painel_vencimentos_proximos(
             }}
             * {{ box-sizing: border-box; }}
             html, body {{
+                width: 100%;
+                height: 100%;
                 margin: 0;
                 padding: 0;
                 background: #030914;
@@ -1895,12 +1897,15 @@ def montar_html_painel_vencimentos_proximos(
             .painel-tv-fullscreen {{
                 position: relative;
                 width: 100%;
-                min-height: 100%;
+                height: 100%;
+                min-height: 960px;
+                display: flex;
+                flex-direction: column;
                 background: #030914;
                 color: var(--texto);
                 border: 2px solid var(--cabecalho);
                 border-radius: 18px;
-                padding: 2.15rem 1.25rem 1.8rem;
+                padding: 1.35rem 1.25rem 1.15rem;
                 overflow: hidden;
             }}
             .botao-fullscreen {{
@@ -1918,23 +1923,24 @@ def montar_html_painel_vencimentos_proximos(
                 padding: .45rem .85rem;
             }}
             .cabecalho-tv {{
+                flex: 0 0 auto;
                 text-align: center;
                 padding-top: .2rem;
             }}
             .logo-tv {{
                 display: block;
-                max-width: 360px;
-                width: min(36vw, 360px);
+                max-width: 260px;
+                width: min(26vw, 260px);
                 height: auto;
-                margin: 0 auto 1.3rem;
+                margin: 0 auto .75rem;
             }}
             .titulo-tv {{
                 color: var(--texto);
-                font-size: 3rem;
+                font-size: 2.45rem;
                 line-height: 1.05;
                 font-weight: 950;
                 letter-spacing: .08em;
-                margin: .35rem 0 0;
+                margin: .2rem 0 0;
                 padding-top: .15rem;
             }}
             .subtitulo-tv {{
@@ -1950,9 +1956,11 @@ def montar_html_painel_vencimentos_proximos(
                 margin-top: .35rem;
             }}
             .tabela-tv-wrap {{
+                flex: 1 1 auto;
+                min-height: 0;
                 width: 100%;
-                max-height: 560px;
-                margin-top: 1.2rem;
+                max-height: none;
+                margin-top: .95rem;
                 overflow-y: auto;
                 overflow-x: hidden;
                 border: 1px solid #D8C98D;
@@ -2106,7 +2114,7 @@ def mostrar_painel_vencimentos_proximos(
     configurar_recarga_diaria()
     proximos = buscar_vencimentos_proximos(documentos_banco, date.today(), 30)
     tabela = preparar_vencimentos_proximos_tv(proximos)
-    altura = min(820, 245 + max(len(tabela), 1) * 54)
+    altura = 1020
     components.html(
         montar_html_painel_vencimentos_proximos(
             tabela,

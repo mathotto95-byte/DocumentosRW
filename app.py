@@ -1887,7 +1887,7 @@ def montar_html_painel_vencimentos_proximos(
             html, body {{
                 margin: 0;
                 padding: 0;
-                background: transparent;
+                background: #030914;
                 color: var(--texto);
                 font-family: "Source Sans Pro", Arial, sans-serif;
                 overflow: hidden;
@@ -1896,6 +1896,7 @@ def montar_html_painel_vencimentos_proximos(
                 position: relative;
                 width: 100%;
                 min-height: 100%;
+                background: #030914;
                 color: var(--texto);
                 border: 2px solid var(--cabecalho);
                 border-radius: 18px;
@@ -1956,6 +1957,7 @@ def montar_html_painel_vencimentos_proximos(
                 overflow-x: hidden;
                 border: 1px solid #D8C98D;
                 border-radius: 12px;
+                background: #071526;
             }}
             .tabela-tv {{
                 width: 100%;
@@ -1974,12 +1976,16 @@ def montar_html_painel_vencimentos_proximos(
                 padding: 12px 10px;
             }}
             .tabela-tv td {{
+                background: #071526;
                 color: var(--texto);
                 font-size: 20px;
                 padding: 12px 10px;
                 border-bottom: 1px solid #D8C98D;
                 overflow-wrap: anywhere;
                 vertical-align: middle;
+            }}
+            .tabela-tv tr:nth-child(even) td {{
+                background: #0f2438;
             }}
             .tabela-tv td:nth-child(3),
             .tabela-tv td:nth-child(4) {{

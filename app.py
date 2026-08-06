@@ -1840,13 +1840,15 @@ def estilizar_tabela_vencimentos_proximos(df: pd.DataFrame):
 def montar_html_painel_vencimentos_proximos(
     tabela: pd.DataFrame,
     atualizado_banco: str = "",
+    compacto: bool = False,
 ) -> str:
     logo_uri = logo_data_uri()
     logo_html = (
         f'<img class="logo-tv" src="{logo_uri}" alt="Logo DocumentosRW">'
-        if logo_uri else ""
+        if logo_uri and not compacto else ""
     )
     atualizado_banco = atualizado_banco or "Sem atualizacao"
+    compacto_class = " painel-tv-compacto" if compacto else ""
     if tabela.empty:
         corpo_tabela = (
             '<div class="mensagem-vazia">'
@@ -1898,14 +1900,14 @@ def montar_html_painel_vencimentos_proximos(
                 position: relative;
                 width: 100%;
                 height: 100%;
-                min-height: 960px;
+                min-height: 0;
                 display: flex;
                 flex-direction: column;
                 background: #030914;
                 color: var(--texto);
-                border: 2px solid var(--cabecalho);
-                border-radius: 10px;
-                padding: .85rem 1rem .8rem;
+                border: 1px solid var(--cabecalho);
+                border-radius: 8px;
+                padding: .45rem .55rem .45rem;
                 overflow: hidden;
             }}
             .botao-fullscreen {{
@@ -1936,35 +1938,35 @@ def montar_html_painel_vencimentos_proximos(
             }}
             .titulo-tv {{
                 color: var(--texto);
-                font-size: 2.15rem;
+                font-size: 1.55rem;
                 line-height: 1.05;
                 font-weight: 950;
                 letter-spacing: .08em;
-                margin: .2rem 0 0;
-                padding-top: .15rem;
+                margin: .05rem 0 0;
+                padding-top: 0;
             }}
             .subtitulo-tv {{
                 color: var(--texto);
-                font-size: 1.05rem;
+                font-size: .82rem;
                 font-weight: 700;
-                margin-top: .45rem;
+                margin-top: .18rem;
             }}
             .atualizacao-banco-tv {{
                 color: var(--texto);
-                font-size: .98rem;
+                font-size: .78rem;
                 font-weight: 850;
-                margin-top: .35rem;
+                margin-top: .12rem;
             }}
             .tabela-tv-wrap {{
                 flex: 1 1 auto;
                 min-height: 0;
                 width: 100%;
                 max-height: none;
-                margin-top: .75rem;
+                margin-top: .35rem;
                 overflow-y: auto;
                 overflow-x: hidden;
                 border: 1px solid #D8C98D;
-                border-radius: 12px;
+                border-radius: 8px;
                 background: #071526;
             }}
             .tabela-tv {{
@@ -1978,16 +1980,16 @@ def montar_html_painel_vencimentos_proximos(
                 z-index: 2;
                 background-color: var(--cabecalho);
                 color: var(--texto);
-                font-size: 19px;
+                font-size: 14px;
                 font-weight: 800;
                 text-align: center;
-                padding: 12px 10px;
+                padding: 6px 8px;
             }}
             .tabela-tv td {{
                 background: #071526;
                 color: var(--texto);
-                font-size: 20px;
-                padding: 12px 10px;
+                font-size: 15px;
+                padding: 6px 8px;
                 border-bottom: 1px solid #D8C98D;
                 overflow-wrap: anywhere;
                 vertical-align: middle;
@@ -2013,7 +2015,7 @@ def montar_html_painel_vencimentos_proximos(
                 width: 100vw;
                 height: 100vh;
                 border-radius: 0;
-                padding: clamp(2rem, 4vh, 4rem) clamp(1.4rem, 3vw, 4rem);
+                padding: clamp(.4rem, 1vh, .8rem) clamp(.45rem, 1vw, 1rem);
                 display: flex;
                 flex-direction: column;
             }}
@@ -2021,39 +2023,72 @@ def montar_html_painel_vencimentos_proximos(
                 flex: 0 0 auto;
             }}
             .painel-tv-fullscreen:fullscreen .logo-tv {{
-                width: min(34vw, 500px);
-                max-width: 500px;
-                margin-bottom: clamp(1rem, 2vh, 2rem);
+                width: min(18vw, 220px);
+                max-width: 220px;
+                margin-bottom: .25rem;
             }}
             .painel-tv-fullscreen:fullscreen .titulo-tv {{
-                font-size: clamp(3.2rem, 6vw, 6.5rem);
+                font-size: clamp(1.35rem, 2.2vw, 2.2rem);
             }}
             .painel-tv-fullscreen:fullscreen .subtitulo-tv {{
-                font-size: clamp(1.25rem, 2vw, 2.1rem);
+                font-size: clamp(.75rem, 1.1vw, 1rem);
             }}
             .painel-tv-fullscreen:fullscreen .tabela-tv-wrap {{
                 flex: 1 1 auto;
                 min-height: 0;
                 max-height: none;
-                margin-top: clamp(1rem, 2.5vh, 2rem);
+                margin-top: clamp(.25rem, .8vh, .55rem);
             }}
             .painel-tv-fullscreen:fullscreen .tabela-tv th {{
-                font-size: clamp(1.35rem, 2vw, 2.4rem);
-                padding: clamp(.8rem, 1.5vh, 1.4rem);
+                font-size: clamp(.85rem, 1.1vw, 1.2rem);
+                padding: clamp(.28rem, .7vh, .48rem);
             }}
             .painel-tv-fullscreen:fullscreen .tabela-tv td {{
-                font-size: clamp(1.25rem, 1.8vw, 2.15rem);
-                padding: clamp(.75rem, 1.4vh, 1.35rem);
+                font-size: clamp(.82rem, 1.05vw, 1.15rem);
+                padding: clamp(.28rem, .7vh, .48rem);
             }}
             .painel-tv-fullscreen:fullscreen .botao-fullscreen {{
                 top: 1.2rem;
                 right: 1.4rem;
                 font-size: clamp(1rem, 1.4vw, 1.45rem);
             }}
+            .painel-tv-compacto {{
+                border: 0;
+                padding: .15rem .25rem .25rem;
+            }}
+            .painel-tv-compacto .botao-fullscreen,
+            .painel-tv-compacto .logo-tv,
+            .painel-tv-compacto .titulo-tv,
+            .painel-tv-compacto .subtitulo-tv {{
+                display: none;
+            }}
+            .painel-tv-compacto .cabecalho-tv {{
+                text-align: left;
+                min-height: 0;
+                padding: 0;
+            }}
+            .painel-tv-compacto .atualizacao-banco-tv {{
+                font-size: 11px;
+                line-height: 1.1;
+                margin: 0 0 .15rem;
+                opacity: .82;
+            }}
+            .painel-tv-compacto .tabela-tv-wrap {{
+                margin-top: 0;
+                border-radius: 6px;
+            }}
+            .painel-tv-compacto .tabela-tv th {{
+                font-size: 12px;
+                padding: 4px 6px;
+            }}
+            .painel-tv-compacto .tabela-tv td {{
+                font-size: 13px;
+                padding: 4px 6px;
+            }}
         </style>
     </head>
     <body>
-        <section id="painel-vencimentos-proximos" class="painel-tv-fullscreen">
+        <section id="painel-vencimentos-proximos" class="painel-tv-fullscreen{compacto_class}">
             <button id="botao-fullscreen" class="botao-fullscreen" type="button">
                 Tela cheia
             </button>
@@ -2110,6 +2145,7 @@ def montar_html_painel_vencimentos_proximos(
 def mostrar_painel_vencimentos_proximos(
     documentos_banco: pd.DataFrame,
     atualizado_banco: str = "",
+    compacto: bool = False,
 ) -> None:
     configurar_recarga_diaria()
     proximos = buscar_vencimentos_proximos(documentos_banco, date.today(), 30)
@@ -2119,6 +2155,7 @@ def mostrar_painel_vencimentos_proximos(
         montar_html_painel_vencimentos_proximos(
             tabela,
             atualizado_banco or ultima_atualizacao_banco_documentos(),
+            compacto=compacto,
         ),
         height=altura,
         scrolling=False,
@@ -2243,7 +2280,7 @@ def render_tv_documentos_coupa() -> None:
     if documentos_banco.empty:
         st.warning("Nenhum documento importado. Abra com ?admin=1 para importar a base.")
         return
-    mostrar_painel_vencimentos_proximos(documentos_banco, atualizacao_documentos)
+    mostrar_painel_vencimentos_proximos(documentos_banco, atualizacao_documentos, compacto=embed_tv)
 
 
 def estilizar_tabela(df: pd.DataFrame):

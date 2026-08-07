@@ -166,6 +166,42 @@ def converter_data_hora_iso(valor) -> str:
     return convertido.isoformat(timespec="seconds")
 
 
+def timestamp_prioridade(valor) -> str:
+    if not valor:
+        return ""
+    try:
+        convertido = datetime.fromisoformat(str(valor))
+    except (TypeError, ValueError):
+        convertido = pd.to_datetime(valor, errors="coerce")
+        if pd.isna(convertido):
+            return ""
+        convertido = convertido.to_pydatetime()
+    return convertido.isoformat(timespec="seconds")
+
+
+def inteiro_prioridade(valor) -> int:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return 0
+    try:
+        return int(valor)
+    except (TypeError, ValueError):
+        return 0
+
+
+def prioridade_documento(
+    vencimento: str,
+    atualizado_em: str,
+    origem: str = "",
+    importacao_id: int | None = None,
+) -> tuple:
+    return (
+        timestamp_prioridade(atualizado_em),
+        1 if str(origem or "").strip().upper() == "PLANILHA DE DOCUMENTOS" else 0,
+        inteiro_prioridade(importacao_id),
+        str(vencimento or ""),
+    )
+
+
 def classificar_documento(valor) -> str | None:
     texto = normalizar_texto(valor)
     if not texto:
@@ -652,15 +688,15 @@ def salvar_importacao(
     for registro in registros:
         chave = (registro["placa"], registro["documento"])
         anterior = consolidados.get(chave)
-        prioridade_registro = (
+        prioridade_registro = prioridade_documento(
             registro["vencimento"],
             registro.get("alterado_em_origem", ""),
-            registro.get("origem") == "PLANILHA DE DOCUMENTOS",
+            registro.get("origem", ""),
         )
-        prioridade_anterior = (
+        prioridade_anterior = prioridade_documento(
             anterior["vencimento"],
             anterior.get("alterado_em_origem", ""),
-            anterior.get("origem") == "PLANILHA DE DOCUMENTOS",
+            anterior.get("origem", ""),
         ) if anterior else None
         if anterior is None or prioridade_registro > prioridade_anterior:
             consolidados[chave] = registro
@@ -736,19 +772,23 @@ def salvar_importacao(
                 estatisticas["inseridos"] += 1
                 continue
 
-            if registro["vencimento"] < existente["vencimento"]:
+            prioridade_registro = prioridade_documento(
+                registro["vencimento"],
+                alterado_em_registro,
+                registro.get("origem", ""),
+                importacao_id,
+            )
+            prioridade_existente = prioridade_documento(
+                existente["vencimento"],
+                existente["importado_em"],
+                existente["origem"],
+                existente["importacao_id"],
+            )
+            if prioridade_registro <= prioridade_existente:
                 estatisticas["ignorados"] += 1
                 continue
 
             if registro["vencimento"] == existente["vencimento"]:
-                alterado_em_origem = registro.get("alterado_em_origem", "")
-                mesmos_dados_controle = (
-                    alterado_em_origem == existente["importado_em"]
-                    and alterado_por_registro == existente["importado_por"]
-                )
-                if not alterado_em_origem or mesmos_dados_controle:
-                    estatisticas["ignorados"] += 1
-                    continue
                 conn.execute(
                     """
                     UPDATE documentos SET
@@ -859,6 +899,32 @@ def consultar_sql(sql: str, parametros: tuple = ()) -> pd.DataFrame:
         return pd.read_sql_query(sql, conn, params=parametros)
 
 
+def consolidar_documentos_mais_atualizados(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    resultado = df.copy()
+    if "importacao_id" not in resultado.columns:
+        resultado["importacao_id"] = 0
+    if "origem" not in resultado.columns:
+        resultado["origem"] = ""
+    resultado["_prioridade_atualizacao"] = resultado.apply(
+        lambda row: prioridade_documento(
+            row.get("vencimento", ""),
+            row.get("importado_em", ""),
+            row.get("origem", ""),
+            row.get("importacao_id", 0),
+        ),
+        axis=1,
+    )
+    resultado = (
+        resultado.sort_values("_prioridade_atualizacao", ascending=False)
+        .drop_duplicates(subset=["placa", "documento"], keep="first")
+        .drop(columns=["_prioridade_atualizacao"], errors="ignore")
+        .reset_index(drop=True)
+    )
+    return resultado
+
+
 def carregar_documentos() -> pd.DataFrame:
     df = consultar_sql(
         """
@@ -866,9 +932,15 @@ def carregar_documentos() -> pd.DataFrame:
                placa_carreta_1, placa_carreta_2, equipamento, origem,
                importado_em, importado_por, importacao_id
         FROM documentos
+        UNION ALL
+        SELECT placa, documento, vencimento, composicao, placa_cavalo,
+               placa_carreta_1, placa_carreta_2, equipamento, origem,
+               importado_em, importado_por, importacao_original_id AS importacao_id
+        FROM historico_documentos
         """
     )
     if not df.empty:
+        df = consolidar_documentos_mais_atualizados(df)
         df["vencimento"] = pd.to_datetime(df["vencimento"], errors="coerce")
     return df
 

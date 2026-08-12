@@ -105,6 +105,28 @@ def limpar_placa(valor) -> str:
     return re.sub(r"[^A-Z0-9]", "", normalizar_texto(valor))
 
 
+def chave_composicao(valor) -> str:
+    texto = normalizar_texto(valor)
+    placas = re.findall(r"(?<![A-Z0-9])([A-Z0-9]{7})(?![A-Z0-9])", texto)
+    if not placas:
+        texto_limpo = limpar_placa(valor)
+        if texto_limpo and len(texto_limpo) % 7 == 0:
+            placas = [
+                texto_limpo[indice: indice + 7]
+                for indice in range(0, len(texto_limpo), 7)
+            ]
+    if placas:
+        return " + ".join(sorted(dict.fromkeys(placas)))
+    return limpar_placa(valor)
+
+
+def chave_documento_consolidacao(valor) -> str:
+    documento = classificar_documento(valor) or normalizar_texto(valor)
+    if documento in {"IBAMA", "CR IBAMA"}:
+        return "IBAMA"
+    return documento
+
+
 def data_excel_serial(valor):
     try:
         numero = float(valor)
@@ -916,21 +938,45 @@ def consolidar_documentos_mais_atualizados(df: pd.DataFrame) -> pd.DataFrame:
         ),
         axis=1,
     )
+    resultado["_chave_placa_consolidacao"] = resultado["placa"].apply(limpar_placa)
+    resultado["_chave_documento_consolidacao"] = resultado["documento"].apply(
+        chave_documento_consolidacao
+    )
     resultado = (
         resultado.sort_values("_prioridade_atualizacao", ascending=False)
-        .drop_duplicates(subset=["placa", "documento"], keep="first")
+        .drop_duplicates(
+            subset=["_chave_placa_consolidacao", "_chave_documento_consolidacao"],
+            keep="first",
+        )
         .reset_index(drop=True)
     )
     if "composicao" in resultado.columns:
-        composicao_valida = resultado["composicao"].astype(str).str.strip().ne("")
+        resultado["_chave_composicao_consolidacao"] = resultado["composicao"].apply(
+            chave_composicao
+        )
+        composicao_valida = resultado["_chave_composicao_consolidacao"].str.strip().ne("")
         com_composicao = resultado[composicao_valida]
         sem_composicao = resultado[~composicao_valida]
         com_composicao = (
             com_composicao.sort_values("_prioridade_atualizacao", ascending=False)
-            .drop_duplicates(subset=["composicao", "documento"], keep="first")
+            .drop_duplicates(
+                subset=[
+                    "_chave_composicao_consolidacao",
+                    "_chave_documento_consolidacao",
+                ],
+                keep="first",
+            )
         )
         resultado = pd.concat([com_composicao, sem_composicao], ignore_index=True)
-    resultado = resultado.drop(columns=["_prioridade_atualizacao"], errors="ignore")
+    resultado = resultado.drop(
+        columns=[
+            "_prioridade_atualizacao",
+            "_chave_placa_consolidacao",
+            "_chave_documento_consolidacao",
+            "_chave_composicao_consolidacao",
+        ],
+        errors="ignore",
+    )
     return resultado
 
 

@@ -195,9 +195,9 @@ def prioridade_documento(
     importacao_id: int | None = None,
 ) -> tuple:
     return (
+        inteiro_prioridade(importacao_id),
         timestamp_prioridade(atualizado_em),
         1 if str(origem or "").strip().upper() == "PLANILHA DE DOCUMENTOS" else 0,
-        inteiro_prioridade(importacao_id),
         str(vencimento or ""),
     )
 
@@ -2792,6 +2792,7 @@ def main() -> None:
         )
 
     documentos_status = enriquecer_status(documentos_banco, data_referencia)
+    documentos_status = consolidar_documentos_mais_atualizados(documentos_status)
     auditoria = carregar_historico_atualizacoes()
     if "filtro_card" not in st.session_state:
         st.session_state.filtro_card = "TODOS"
@@ -2997,9 +2998,9 @@ def main() -> None:
 
     st.info(
         "Regra de atualização: cada registro ativo é identificado por placa + tipo de "
-        "documento. O maior vencimento permanece ativo; duplicatas e datas mais antigas "
-        "são ignoradas. A última base de composições salva é reutilizada automaticamente "
-        "quando uma nova base não é enviada."
+        "documento. Em caso de duplicidade, permanece o registro da importação ou "
+        "atualização mais recente. A última base de composições salva é reutilizada "
+        "automaticamente quando uma nova base não é enviada."
     )
 
     with st.expander("Histórico de Atualização", expanded=False):

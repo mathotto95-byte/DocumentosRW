@@ -919,9 +919,18 @@ def consolidar_documentos_mais_atualizados(df: pd.DataFrame) -> pd.DataFrame:
     resultado = (
         resultado.sort_values("_prioridade_atualizacao", ascending=False)
         .drop_duplicates(subset=["placa", "documento"], keep="first")
-        .drop(columns=["_prioridade_atualizacao"], errors="ignore")
         .reset_index(drop=True)
     )
+    if "composicao" in resultado.columns:
+        composicao_valida = resultado["composicao"].astype(str).str.strip().ne("")
+        com_composicao = resultado[composicao_valida]
+        sem_composicao = resultado[~composicao_valida]
+        com_composicao = (
+            com_composicao.sort_values("_prioridade_atualizacao", ascending=False)
+            .drop_duplicates(subset=["composicao", "documento"], keep="first")
+        )
+        resultado = pd.concat([com_composicao, sem_composicao], ignore_index=True)
+    resultado = resultado.drop(columns=["_prioridade_atualizacao"], errors="ignore")
     return resultado
 
 
@@ -1661,9 +1670,9 @@ def aplicar_filtros(
             )
         ]
     if data_inicio:
-        resultado = resultado["vencimento"].ge(pd.Timestamp(data_inicio))
+        resultado = resultado[resultado["vencimento"].ge(pd.Timestamp(data_inicio))]
     if data_fim:
-        resultado = resultado["vencimento"].le(pd.Timestamp(data_fim))
+        resultado = resultado[resultado["vencimento"].le(pd.Timestamp(data_fim))]
     if documentos:
         resultado = resultado[resultado["documento"].isin(documentos)]
 
@@ -2997,7 +3006,7 @@ def main() -> None:
         )
 
     st.info(
-        "Regra de atualização: cada registro ativo é identificado por placa + tipo de "
+        "Regra de atualização: cada registro ativo é identificado por placa/composição + tipo de "
         "documento. Em caso de duplicidade, permanece o registro da importação ou "
         "atualização mais recente. A última base de composições salva é reutilizada "
         "automaticamente quando uma nova base não é enviada."

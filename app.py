@@ -32,6 +32,7 @@ WEB_LOGO_PATH = WEB_ASSETS_DIR / "logo.png"
 COR_CABECALHO = "#020D3F"
 COR_TEXTO = "#B5911B"
 CONTROLE_TV_COUPA_URL = "https://controle-integrado.streamlit.app/?tv=documentos-coupa&painel=coupa"
+MANUTENCAO_COLUNAS = ["Placa", "Manutenção Programada", "Data Saída"]
 
 TIPOS_DOCUMENTO = [
     "CIV",
@@ -370,6 +371,91 @@ def configurar_recarga_diaria() -> None:
     )
 
 
+def formatar_data_saida_manutencao(valor) -> str:
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return ""
+    if isinstance(valor, pd.Timestamp):
+        return valor.strftime("%d/%m/%Y") if not pd.isna(valor) else ""
+    if isinstance(valor, datetime):
+        return valor.strftime("%d/%m/%Y")
+    if isinstance(valor, date):
+        return valor.strftime("%d/%m/%Y")
+    convertido = pd.to_datetime(valor, dayfirst=True, errors="coerce")
+    if not pd.isna(convertido):
+        return convertido.strftime("%d/%m/%Y")
+    return str(valor).strip()
+
+
+def carregar_manutencoes_programadas() -> pd.DataFrame:
+    colunas_sql = "placa, manutencao_programada, data_saida"
+    with conectar() as conn:
+        linhas = conn.execute(
+            f"""
+            SELECT {colunas_sql}
+            FROM manutencoes_programadas
+            ORDER BY ordem, id
+            """
+        ).fetchall()
+    if not linhas:
+        return pd.DataFrame(columns=MANUTENCAO_COLUNAS)
+    return pd.DataFrame(
+        [
+            {
+                "Placa": row["placa"],
+                "Manutenção Programada": row["manutencao_programada"],
+                "Data Saída": row["data_saida"],
+            }
+            for row in linhas
+        ],
+        columns=MANUTENCAO_COLUNAS,
+    )
+
+
+def salvar_manutencoes_programadas(df: pd.DataFrame) -> int:
+    registros = []
+    for _, row in df.iterrows():
+        placa = limpar_placa(row.get("Placa", ""))
+        manutencao = str(row.get("Manutenção Programada", "") or "").strip()
+        data_saida = formatar_data_saida_manutencao(row.get("Data Saída"))
+        if not placa and not manutencao and not data_saida:
+            continue
+        registros.append((len(registros) + 1, placa, manutencao, data_saida))
+
+    atualizado_em = agora_local().isoformat(timespec="seconds")
+    with conectar() as conn:
+        conn.execute("DELETE FROM manutencoes_programadas")
+        conn.executemany(
+            """
+            INSERT INTO manutencoes_programadas
+                (ordem, placa, manutencao_programada, data_saida, atualizado_em)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [(*registro, atualizado_em) for registro in registros],
+        )
+    return len(registros)
+
+
+def ultima_atualizacao_manutencoes() -> str:
+    with conectar() as conn:
+        row = conn.execute(
+            "SELECT MAX(atualizado_em) AS atualizado_em FROM manutencoes_programadas"
+        ).fetchone()
+    return formatar_data_hora(row["atualizado_em"]) if row and row["atualizado_em"] else "Sem registros salvos"
+
+
+def preparar_editor_manutencoes(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            [{"Placa": "", "Manutenção Programada": "", "Data Saída": None}],
+            columns=MANUTENCAO_COLUNAS,
+        )
+    editor = df.copy()
+    editor["Data Saída"] = pd.to_datetime(
+        editor["Data Saída"], dayfirst=True, errors="coerce"
+    ).dt.date
+    return editor[MANUTENCAO_COLUNAS]
+
+
 def criar_nomes_unicos(colunas) -> list[str]:
     usados: dict[str, int] = {}
     novas = []
@@ -513,6 +599,15 @@ def inicializar_banco() -> None:
                 FOREIGN KEY (importacao_id) REFERENCES importacoes(id)
             );
 
+            CREATE TABLE IF NOT EXISTS manutencoes_programadas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ordem INTEGER NOT NULL,
+                placa TEXT NOT NULL,
+                manutencao_programada TEXT NOT NULL,
+                data_saida TEXT,
+                atualizado_em TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_documentos_vencimento
                 ON documentos(vencimento);
             CREATE INDEX IF NOT EXISTS idx_historico_bases_data
@@ -523,6 +618,8 @@ def inicializar_banco() -> None:
                 ON historico_atualizacoes(data_hora DESC);
             CREATE INDEX IF NOT EXISTS idx_backup_importacao
                 ON backup_documentos(importacao_id);
+            CREATE INDEX IF NOT EXISTS idx_manutencoes_ordem
+                ON manutencoes_programadas(ordem, id);
             """
         )
         if conn.execute("SELECT COUNT(*) FROM historico_atualizacoes").fetchone()[0] == 0:
@@ -1979,6 +2076,12 @@ def montar_html_painel_vencimentos_proximos(
     tabela: pd.DataFrame,
     atualizado_banco: str = "",
     compacto: bool = False,
+    titulo: str = "VENCIMENTOS PR&Oacute;XIMOS",
+    subtitulo: str = "Documentos vencidos em vermelho e vencimentos nos pr&oacute;ximos 30 dias",
+    mensagem_vazia: str = "Nenhum documento vencido ou com vencimento nos pr&oacute;ximos 30 dias.",
+    painel_id: str = "painel-vencimentos-proximos",
+    destacar_vencidos: bool = True,
+    rotulo_atualizacao: str = "Atualizacao do banco Documentos",
 ) -> str:
     logo_uri = logo_data_uri()
     logo_html = (
@@ -1990,7 +2093,7 @@ def montar_html_painel_vencimentos_proximos(
     if tabela.empty:
         corpo_tabela = (
             '<div class="mensagem-vazia">'
-            "Nenhum documento vencido ou com vencimento nos pr&oacute;ximos 30 dias."
+            f"{mensagem_vazia}"
             "</div>"
         )
     else:
@@ -2000,7 +2103,11 @@ def montar_html_painel_vencimentos_proximos(
         linhas = []
         for _, row in tabela.iterrows():
             prazo = str(row.get("Prazo", ""))
-            classe_linha = ' class="linha-vencida"' if "vencido" in prazo.lower() else ""
+            classe_linha = (
+                ' class="linha-vencida"'
+                if destacar_vencidos and "vencido" in prazo.lower()
+                else ""
+            )
             celulas = "".join(
                 f"<td>{html.escape(str(row[coluna]))}</td>"
                 for coluna in tabela.columns
@@ -2232,24 +2339,24 @@ def montar_html_painel_vencimentos_proximos(
         </style>
     </head>
     <body>
-        <section id="painel-vencimentos-proximos" class="painel-tv-fullscreen{compacto_class}">
+        <section id="{html.escape(painel_id)}" class="painel-tv-fullscreen{compacto_class}">
             <button id="botao-fullscreen" class="botao-fullscreen" type="button">
                 Tela cheia
             </button>
             <header class="cabecalho-tv">
                 {logo_html}
-                <div class="titulo-tv">VENCIMENTOS PR&Oacute;XIMOS</div>
+                <div class="titulo-tv">{titulo}</div>
                 <div class="subtitulo-tv">
-                    Documentos vencidos em vermelho e vencimentos nos pr&oacute;ximos 30 dias
+                    {subtitulo}
                 </div>
                 <div class="atualizacao-banco-tv">
-                    Atualizacao do banco Documentos: {html.escape(atualizado_banco)}
+                    {html.escape(rotulo_atualizacao)}: {html.escape(atualizado_banco)}
                 </div>
             </header>
             {corpo_tabela}
         </section>
         <script>
-            const painel = document.getElementById("painel-vencimentos-proximos");
+            const painel = document.getElementById("{html.escape(painel_id)}");
             const botao = document.getElementById("botao-fullscreen");
             if (window.frameElement) {{
                 window.frameElement.setAttribute("allowfullscreen", "true");
@@ -2304,6 +2411,89 @@ def mostrar_painel_vencimentos_proximos(
         height=altura,
         scrolling=False,
     )
+
+
+def mostrar_painel_manutencao_programada(compacto: bool = False) -> None:
+    configurar_recarga_diaria()
+    tabela = carregar_manutencoes_programadas()
+    components.html(
+        montar_html_painel_vencimentos_proximos(
+            tabela,
+            ultima_atualizacao_manutencoes(),
+            compacto=compacto,
+            titulo="MANUTEN&Ccedil;&Atilde;O PROGRAMADA",
+            subtitulo="Placas com manuten&ccedil;&atilde;o programada e data de sa&iacute;da",
+            mensagem_vazia="Nenhuma manuten&ccedil;&atilde;o programada cadastrada.",
+            painel_id="painel-manutencao-programada",
+            destacar_vencidos=False,
+            rotulo_atualizacao="Atualizacao do painel",
+        ),
+        height=1020,
+        scrolling=False,
+    )
+
+
+def render_editor_manutencao_programada() -> None:
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            padding-top: 1.2rem !important;
+            max-width: 1250px !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="titulo">Manutenção programada</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<div class="subtitulo">Preencha as placas que devem aparecer na LogisTV.</div>',
+        unsafe_allow_html=True,
+    )
+    dados = carregar_manutencoes_programadas()
+    editor = st.data_editor(
+        preparar_editor_manutencoes(dados),
+        column_config={
+            "Placa": st.column_config.TextColumn("Placa", width="medium"),
+            "Manutenção Programada": st.column_config.TextColumn(
+                "Manutenção Programada", width="large"
+            ),
+            "Data Saída": st.column_config.DateColumn(
+                "Data Saída", format="DD/MM/YYYY", width="medium"
+            ),
+        },
+        hide_index=True,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="editor_manutencao_programada",
+    )
+    col_salvar, col_tv = st.columns([0.35, 0.65])
+    with col_salvar:
+        if st.button("Salvar painel", type="primary", use_container_width=True):
+            total = salvar_manutencoes_programadas(editor)
+            st.success(f"Painel salvo com {total} registro(s).")
+            st.rerun()
+    with col_tv:
+        st.link_button(
+            "Abrir visualização TV",
+            "?painel=manutencao&embed_tv=1",
+            use_container_width=True,
+        )
+
+    st.markdown('<div class="faixa">Prévia da TV</div>', unsafe_allow_html=True)
+    mostrar_painel_manutencao_programada(compacto=True)
+
+
+def render_painel_manutencao_programada() -> None:
+    inicializar_banco()
+    css_tv_documentos_coupa()
+    if query_ativo("embed_tv"):
+        mostrar_painel_manutencao_programada(compacto=True)
+    else:
+        render_editor_manutencao_programada()
 
 
 def recarregar_tv(intervalo_segundos: int) -> None:
@@ -2385,6 +2575,14 @@ def render_tv_documentos_coupa() -> None:
     garantir_exportacao_web_diaria()
     css_tv_documentos_coupa()
     painel_param = query_param("painel", "auto").strip().lower()
+    if painel_param in {
+        "manutencao",
+        "manutenção",
+        "manutencao-programada",
+        "manutencao_programada",
+    }:
+        render_painel_manutencao_programada()
+        return
     embed_tv = query_ativo("embed_tv")
     intervalo = pd.to_numeric(pd.Series([query_param("tempo", "60")]), errors="coerce").fillna(60).iloc[0]
     intervalo = max(15, min(600, int(intervalo)))

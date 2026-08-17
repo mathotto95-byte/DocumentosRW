@@ -32,7 +32,7 @@ WEB_LOGO_PATH = WEB_ASSETS_DIR / "logo.png"
 COR_CABECALHO = "#020D3F"
 COR_TEXTO = "#B5911B"
 CONTROLE_TV_COUPA_URL = "https://controle-integrado.streamlit.app/?tv=documentos-coupa&painel=coupa"
-MANUTENCAO_COLUNAS = ["Placa", "Manutenção Programada", "Data Saída"]
+MANUTENCAO_COLUNAS = ["Placa", "Manutenção Programada", "Previsão Saída"]
 
 TIPOS_DOCUMENTO = [
     "CIV",
@@ -403,7 +403,7 @@ def carregar_manutencoes_programadas() -> pd.DataFrame:
             {
                 "Placa": row["placa"],
                 "Manutenção Programada": row["manutencao_programada"],
-                "Data Saída": row["data_saida"],
+                "Previsão Saída": row["data_saida"],
             }
             for row in linhas
         ],
@@ -416,7 +416,7 @@ def salvar_manutencoes_programadas(df: pd.DataFrame) -> int:
     for _, row in df.iterrows():
         placa = limpar_placa(row.get("Placa", ""))
         manutencao = str(row.get("Manutenção Programada", "") or "").strip()
-        data_saida = formatar_data_saida_manutencao(row.get("Data Saída"))
+        data_saida = formatar_data_saida_manutencao(row.get("Previsão Saída"))
         if not placa and not manutencao and not data_saida:
             continue
         registros.append((len(registros) + 1, placa, manutencao, data_saida))
@@ -446,12 +446,12 @@ def ultima_atualizacao_manutencoes() -> str:
 def preparar_editor_manutencoes(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(
-            [{"Placa": "", "Manutenção Programada": "", "Data Saída": None}],
+            [{"Placa": "", "Manutenção Programada": "", "Previsão Saída": None}],
             columns=MANUTENCAO_COLUNAS,
         )
     editor = df.copy()
-    editor["Data Saída"] = pd.to_datetime(
-        editor["Data Saída"], dayfirst=True, errors="coerce"
+    editor["Previsão Saída"] = pd.to_datetime(
+        editor["Previsão Saída"], dayfirst=True, errors="coerce"
     ).dt.date
     return editor[MANUTENCAO_COLUNAS]
 
@@ -2422,7 +2422,7 @@ def mostrar_painel_manutencao_programada(compacto: bool = False) -> None:
             ultima_atualizacao_manutencoes(),
             compacto=compacto,
             titulo="MANUTEN&Ccedil;&Atilde;O PROGRAMADA",
-            subtitulo="Placas com manuten&ccedil;&atilde;o programada e data de sa&iacute;da",
+            subtitulo="Placas com manuten&ccedil;&atilde;o programada e previs&atilde;o de sa&iacute;da",
             mensagem_vazia="Nenhuma manuten&ccedil;&atilde;o programada cadastrada.",
             painel_id="painel-manutencao-programada",
             destacar_vencidos=False,
@@ -2461,8 +2461,8 @@ def render_editor_manutencao_programada() -> None:
             "Manutenção Programada": st.column_config.TextColumn(
                 "Manutenção Programada", width="large"
             ),
-            "Data Saída": st.column_config.DateColumn(
-                "Data Saída", format="DD/MM/YYYY", width="medium"
+            "Previsão Saída": st.column_config.DateColumn(
+                "Previsão Saída", format="DD/MM/YYYY", width="medium"
             ),
         },
         hide_index=True,

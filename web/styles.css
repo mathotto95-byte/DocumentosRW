@@ -133,6 +133,11 @@ body {
   font-weight: 800;
 }
 
+.tabela-tv tr.linha-vencida td {
+  color: #ff4d6d;
+  font-weight: 900;
+}
+
 .mensagem-painel {
   margin: 1.2rem;
   border: 1px solid var(--borda);

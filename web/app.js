@@ -47,13 +47,13 @@ function renderizarRegistros(registros) {
   if (!registros.length) {
     corpoTabela.innerHTML = "";
     mensagemPainel.hidden = false;
-    mensagemPainel.textContent = "Nenhum documento com vencimento nos próximos 30 dias.";
+    mensagemPainel.textContent = "Nenhum documento vencido ou com vencimento nos próximos 30 dias.";
     return;
   }
 
   mensagemPainel.hidden = true;
   corpoTabela.innerHTML = ordenarRegistros(registros).map((registro) => `
-    <tr>
+    <tr class="${Number(registro.dias_restantes) < 0 ? "linha-vencida" : ""}">
       <td>${escaparTexto(registro.tipo_documento)}</td>
       <td>${escaparTexto(registro.placas_composicao)}</td>
       <td>${escaparTexto(registro.data_vencimento)}</td>

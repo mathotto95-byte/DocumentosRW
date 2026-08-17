@@ -310,6 +310,13 @@ def formatar_data_hora(valor) -> str:
 
 
 def texto_dias_restantes(dias: int) -> str:
+    if dias < 0:
+        dias_vencidos = abs(dias)
+        if dias_vencidos == 1:
+            return "1 dia vencido"
+        return f"{dias_vencidos} dias vencidos"
+    if dias == 0:
+        return "vence hoje"
     if dias == 1:
         return "1 dia"
     return f"{dias} dias"
@@ -1586,7 +1593,7 @@ def buscar_vencimentos_proximos(
         return pd.DataFrame(columns=colunas)
 
     dados["dias_restantes"] = (dados["data_vencimento"] - referencia).dt.days
-    dados = dados[dados["dias_restantes"].between(0, dias_janela, inclusive="both")]
+    dados = dados[dados["dias_restantes"].le(dias_janela)]
     if dados.empty:
         return pd.DataFrame(columns=colunas)
 
@@ -1628,7 +1635,7 @@ def preparar_vencimentos_proximos_tv(df: pd.DataFrame) -> pd.DataFrame:
         "Tipo do documento",
         "Placas da composiÃ§Ã£o",
         "Vencimento",
-        "Dias a vencer",
+        "Prazo",
     ]
     if df.empty:
         return pd.DataFrame(columns=colunas)
@@ -1638,7 +1645,7 @@ def preparar_vencimentos_proximos_tv(df: pd.DataFrame) -> pd.DataFrame:
         columns={
             "tipo_documento": "Tipo do documento",
             "placa_ou_composicao": "Placas da composiÃ§Ã£o",
-            "texto_dias_restantes": "Dias a vencer",
+            "texto_dias_restantes": "Prazo",
         }
     )
     return saida[colunas]
@@ -1674,6 +1681,7 @@ def exportar_vencimentos_proximos_json(
     payload = {
         "atualizado_em": agora_local().isoformat(timespec="seconds"),
         "janela_dias": 30,
+        "inclui_vencidos": True,
         "registros": registros,
     }
     WEB_JSON_PATH.write_text(
@@ -1689,7 +1697,10 @@ def garantir_exportacao_web_diaria() -> None:
         try:
             payload = json.loads(WEB_JSON_PATH.read_text(encoding="utf-8"))
             atualizado_em = datetime.fromisoformat(str(payload.get("atualizado_em", "")))
-            precisa_exportar = atualizado_em.date() < agora_local().date()
+            precisa_exportar = (
+                atualizado_em.date() < agora_local().date()
+                or payload.get("inclui_vencidos") is not True
+            )
         except Exception:
             precisa_exportar = True
     if precisa_exportar:
@@ -1979,7 +1990,7 @@ def montar_html_painel_vencimentos_proximos(
     if tabela.empty:
         corpo_tabela = (
             '<div class="mensagem-vazia">'
-            "Nenhum documento com vencimento nos pr&oacute;ximos 30 dias."
+            "Nenhum documento vencido ou com vencimento nos pr&oacute;ximos 30 dias."
             "</div>"
         )
     else:
@@ -1988,11 +1999,13 @@ def montar_html_painel_vencimentos_proximos(
         )
         linhas = []
         for _, row in tabela.iterrows():
+            prazo = str(row.get("Prazo", ""))
+            classe_linha = ' class="linha-vencida"' if "vencido" in prazo.lower() else ""
             celulas = "".join(
                 f"<td>{html.escape(str(row[coluna]))}</td>"
                 for coluna in tabela.columns
             )
-            linhas.append(f"<tr>{celulas}</tr>")
+            linhas.append(f"<tr{classe_linha}>{celulas}</tr>")
         corpo_tabela = (
             '<div class="tabela-tv-wrap">'
             '<table class="tabela-tv">'
@@ -2129,6 +2142,10 @@ def montar_html_painel_vencimentos_proximos(
                 text-align: center;
                 font-weight: 800;
             }}
+            .tabela-tv tr.linha-vencida td {{
+                color: #ff4d6d;
+                font-weight: 900;
+            }}
             .mensagem-vazia {{
                 margin-top: 1.2rem;
                 border: 1px solid #D8C98D;
@@ -2223,7 +2240,7 @@ def montar_html_painel_vencimentos_proximos(
                 {logo_html}
                 <div class="titulo-tv">VENCIMENTOS PR&Oacute;XIMOS</div>
                 <div class="subtitulo-tv">
-                    Documentos com vencimento entre hoje e os pr&oacute;ximos 30 dias
+                    Documentos vencidos em vermelho e vencimentos nos pr&oacute;ximos 30 dias
                 </div>
                 <div class="atualizacao-banco-tv">
                     Atualizacao do banco Documentos: {html.escape(atualizado_banco)}

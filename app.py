@@ -1,14 +1,20 @@
 import base64
 import html
 import json
+import os
 import re
 import shutil
 import sqlite3
 import time
 import unicodedata
+import uuid
 from datetime import date, datetime, timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -33,6 +39,9 @@ COR_CABECALHO = "#020D3F"
 COR_TEXTO = "#B5911B"
 CONTROLE_TV_COUPA_URL = "https://controle-integrado.streamlit.app/?tv=documentos-coupa&painel=coupa"
 MANUTENCAO_COLUNAS = ["Placa", "Manutenção Programada", "Previsão Saída"]
+GITHUB_MANUTENCOES_BACKUP_PATH = "backups/manutencoes_programadas_latest.json"
+GITHUB_MANUTENCOES_BACKUP_HISTORY_DIR = "backups/history"
+GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS = 2
 
 TIPOS_DOCUMENTO = [
     "CIV",
@@ -456,6 +465,334 @@ def preparar_editor_manutencoes(df: pd.DataFrame) -> pd.DataFrame:
     return editor[MANUTENCAO_COLUNAS]
 
 
+GITHUB_SECRET_ALIASES = {
+    "GITHUB_TOKEN": ["GITHUB_TOKEN", "github_token", "token"],
+    "GITHUB_REPOSITORY": ["GITHUB_REPOSITORY", "github_repository", "repository", "repo"],
+    "GITHUB_BRANCH": ["GITHUB_BRANCH", "github_branch", "branch"],
+    "GITHUB_MANUTENCOES_BACKUP_PATH": [
+        "GITHUB_MANUTENCOES_BACKUP_PATH",
+        "github_manutencoes_backup_path",
+        "manutencoes_backup_path",
+    ],
+    "GITHUB_MANUTENCOES_AUTO_BACKUP": [
+        "GITHUB_MANUTENCOES_AUTO_BACKUP",
+        "github_manutencoes_auto_backup",
+        "manutencoes_auto_backup",
+        "GITHUB_AUTO_BACKUP",
+    ],
+    "GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS": [
+        "GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS",
+        "github_manutencoes_backup_interval_hours",
+        "manutencoes_backup_interval_hours",
+    ],
+}
+
+
+def ler_secret_github(nome: str, padrao: str = "") -> str:
+    candidatos = GITHUB_SECRET_ALIASES.get(nome, [nome])
+    try:
+        for candidato in candidatos:
+            valor = st.secrets.get(candidato)
+            if valor not in [None, ""]:
+                return str(valor).strip()
+        github = st.secrets.get("github", {})
+        if github:
+            for candidato in candidatos:
+                valor = github.get(candidato)
+                if valor not in [None, ""]:
+                    return str(valor).strip()
+    except Exception:
+        pass
+    for candidato in candidatos:
+        valor = os.getenv(candidato)
+        if valor not in [None, ""]:
+            return str(valor).strip()
+    return padrao
+
+
+def normalizar_token_github(valor: str) -> str:
+    token = str(valor or "").strip().strip('"').strip("'")
+    for prefixo in ["Bearer ", "bearer ", "token ", "Token "]:
+        if token.startswith(prefixo):
+            token = token[len(prefixo):].strip()
+    return token
+
+
+def token_github_placeholder(token: str) -> bool:
+    limpo = str(token or "").strip()
+    return bool(limpo) and ("..." in limpo or limpo in {"github_pat_", "ghp_", "gho_"})
+
+
+def bool_secret(valor: object, padrao: bool = False) -> bool:
+    texto = str(valor or "").strip().upper()
+    if not texto:
+        return padrao
+    return texto in {"1", "SIM", "S", "TRUE", "YES", "ON"}
+
+
+def configuracoes_backup_manutencoes_github() -> dict[str, Any]:
+    intervalo_texto = ler_secret_github(
+        "GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS",
+        str(GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS),
+    )
+    try:
+        intervalo_horas = max(1, int(float(intervalo_texto)))
+    except (TypeError, ValueError):
+        intervalo_horas = GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS
+    return {
+        "token": normalizar_token_github(ler_secret_github("GITHUB_TOKEN")),
+        "repository": ler_secret_github("GITHUB_REPOSITORY", "mathotto95-byte/DocumentosRW"),
+        "branch": ler_secret_github("GITHUB_BRANCH", "main"),
+        "latest_path": ler_secret_github(
+            "GITHUB_MANUTENCOES_BACKUP_PATH",
+            GITHUB_MANUTENCOES_BACKUP_PATH,
+        ),
+        "auto_backup": bool_secret(
+            ler_secret_github("GITHUB_MANUTENCOES_AUTO_BACKUP", "SIM"),
+            True,
+        ),
+        "interval_hours": intervalo_horas,
+    }
+
+
+def backup_manutencoes_github_configurado() -> bool:
+    config = configuracoes_backup_manutencoes_github()
+    return bool(
+        config["auto_backup"]
+        and config["token"]
+        and not token_github_placeholder(config["token"])
+        and config["repository"]
+        and config["branch"]
+        and config["latest_path"]
+    )
+
+
+def url_conteudo_github(repositorio: str, caminho: str) -> str:
+    caminho_seguro = "/".join(quote(parte) for parte in caminho.strip("/").split("/"))
+    return f"https://api.github.com/repos/{repositorio}/contents/{caminho_seguro}"
+
+
+def request_github(
+    metodo: str,
+    url: str,
+    token: str,
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    dados = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    ultimo_401: HTTPError | None = None
+    for esquema in ["Bearer", "token"]:
+        requisicao = Request(url, data=dados, method=metodo)
+        requisicao.add_header("Accept", "application/vnd.github+json")
+        requisicao.add_header("Authorization", f"{esquema} {token}")
+        requisicao.add_header("X-GitHub-Api-Version", "2022-11-28")
+        if dados is not None:
+            requisicao.add_header("Content-Type", "application/json")
+        try:
+            with urlopen(requisicao, timeout=30) as resposta:
+                bruto = resposta.read()
+            return json.loads(bruto.decode("utf-8")) if bruto else {}
+        except HTTPError as erro:
+            if erro.code == 401 and esquema == "Bearer":
+                ultimo_401 = erro
+                continue
+            raise
+    if ultimo_401:
+        raise ultimo_401
+    return {}
+
+
+def sha_arquivo_github(config: dict[str, Any], caminho: str) -> str:
+    url = url_conteudo_github(config["repository"], caminho) + f"?ref={quote(config['branch'])}"
+    try:
+        resposta = request_github("GET", url, config["token"])
+        return str(resposta.get("sha") or "")
+    except HTTPError as erro:
+        if erro.code == 404:
+            return ""
+        raise
+
+
+def enviar_json_github(
+    config: dict[str, Any],
+    caminho: str,
+    payload_json: dict[str, Any],
+    mensagem: str,
+    tentativas: int = 3,
+) -> None:
+    conteudo = json.dumps(payload_json, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    ultimo_erro: HTTPError | None = None
+    for tentativa in range(max(int(tentativas or 1), 1)):
+        payload = {
+            "message": mensagem,
+            "content": base64.b64encode(conteudo).decode("ascii"),
+            "branch": config["branch"],
+        }
+        sha = sha_arquivo_github(config, caminho)
+        if sha:
+            payload["sha"] = sha
+        try:
+            request_github(
+                "PUT",
+                url_conteudo_github(config["repository"], caminho),
+                config["token"],
+                payload,
+            )
+            return
+        except HTTPError as erro:
+            ultimo_erro = erro
+            if erro.code != 409 or tentativa >= tentativas - 1:
+                raise
+            time.sleep(0.8 + tentativa * 0.8)
+    if ultimo_erro:
+        raise ultimo_erro
+
+
+def mensagem_erro_github(erro: HTTPError) -> str:
+    if erro.code == 401:
+        return "Token GitHub invalido ou expirado."
+    if erro.code == 403:
+        return "Token GitHub sem permissao de escrita em Contents."
+    if erro.code == 404:
+        return "Repositorio, branch ou caminho de backup nao encontrado no GitHub."
+    if erro.code == 422:
+        return "GitHub recusou a gravacao. Confira branch e permissao de escrita."
+    return str(erro)
+
+
+def payload_backup_manutencoes() -> dict[str, Any]:
+    dados = carregar_manutencoes_programadas()
+    registros = json.loads(
+        dados.where(pd.notna(dados), None).to_json(orient="records", force_ascii=False)
+    )
+    return {
+        "schema": "documentos_rw_manutencoes_programadas_backup_v1",
+        "generated_at": agora_local().isoformat(timespec="seconds"),
+        "records": int(len(registros)),
+        "rows": registros,
+    }
+
+
+def registrar_backup_manutencoes_github(
+    status: str,
+    mensagem: str,
+    registros: int = 0,
+) -> None:
+    with conectar() as conn:
+        conn.execute(
+            """
+            INSERT INTO manutencoes_github_backups
+                (data_hora, status, mensagem, registros)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                agora_local().isoformat(timespec="seconds"),
+                str(status or "")[:40],
+                str(mensagem or "")[:500],
+                int(registros or 0),
+            ),
+        )
+
+
+def ultimo_backup_manutencoes_github_sucesso() -> datetime | None:
+    with conectar() as conn:
+        row = conn.execute(
+            """
+            SELECT data_hora
+            FROM manutencoes_github_backups
+            WHERE status = 'SUCESSO'
+            ORDER BY data_hora DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if not row or not row["data_hora"]:
+        return None
+    try:
+        return datetime.fromisoformat(str(row["data_hora"]))
+    except ValueError:
+        return None
+
+
+def backup_manutencoes_github_devido(forcar: bool = False) -> bool:
+    if forcar:
+        return True
+    config = configuracoes_backup_manutencoes_github()
+    ultimo = ultimo_backup_manutencoes_github_sucesso()
+    if ultimo is None:
+        return True
+    return agora_local() - ultimo >= timedelta(hours=int(config["interval_hours"]))
+
+
+def fazer_backup_manutencoes_github(motivo: str = "periodico") -> dict[str, Any]:
+    config = configuracoes_backup_manutencoes_github()
+    payload = payload_backup_manutencoes()
+    registros = int(payload["records"])
+    if token_github_placeholder(config["token"]):
+        resultado = {"status": "TOKEN_INVALIDO", "message": "GITHUB_TOKEN parece incompleto.", "records": registros}
+    elif not backup_manutencoes_github_configurado():
+        resultado = {"status": "NAO_CONFIGURADO", "message": "Configure GITHUB_TOKEN nos Secrets.", "records": registros}
+    else:
+        stamp = agora_local().strftime("%Y%m%d_%H%M%S")
+        historico = (
+            f"{GITHUB_MANUTENCOES_BACKUP_HISTORY_DIR}/"
+            f"{stamp}_{uuid.uuid4().hex[:8]}_manutencoes_programadas.json"
+        )
+        try:
+            enviar_json_github(
+                config,
+                config["latest_path"],
+                payload,
+                f"Backup manutencoes programadas latest ({motivo})",
+            )
+            enviar_json_github(
+                config,
+                historico,
+                payload,
+                f"Backup manutencoes programadas historico ({motivo})",
+                tentativas=1,
+            )
+            resultado = {
+                "status": "SUCESSO",
+                "message": f"Backup enviado para {config['latest_path']}.",
+                "records": registros,
+            }
+        except HTTPError as erro:
+            resultado = {"status": "ERRO", "message": mensagem_erro_github(erro), "records": registros}
+        except (URLError, TimeoutError) as erro:
+            resultado = {"status": "ERRO", "message": str(erro), "records": registros}
+    registrar_backup_manutencoes_github(
+        resultado["status"], resultado["message"], resultado["records"]
+    )
+    return resultado
+
+
+def fazer_backup_manutencoes_github_periodico() -> dict[str, Any] | None:
+    if not backup_manutencoes_github_configurado():
+        return None
+    if not backup_manutencoes_github_devido():
+        return None
+    return fazer_backup_manutencoes_github("periodico_2h")
+
+
+def ultimo_status_backup_manutencoes_github() -> dict[str, Any]:
+    with conectar() as conn:
+        row = conn.execute(
+            """
+            SELECT data_hora, status, mensagem, registros
+            FROM manutencoes_github_backups
+            ORDER BY data_hora DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        return {}
+    return {
+        "data_hora": formatar_data_hora(row["data_hora"]),
+        "status": row["status"],
+        "mensagem": row["mensagem"],
+        "registros": int(row["registros"] or 0),
+    }
+
+
 def criar_nomes_unicos(colunas) -> list[str]:
     usados: dict[str, int] = {}
     novas = []
@@ -608,6 +945,14 @@ def inicializar_banco() -> None:
                 atualizado_em TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS manutencoes_github_backups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_hora TEXT NOT NULL,
+                status TEXT NOT NULL,
+                mensagem TEXT,
+                registros INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE INDEX IF NOT EXISTS idx_documentos_vencimento
                 ON documentos(vencimento);
             CREATE INDEX IF NOT EXISTS idx_historico_bases_data
@@ -620,6 +965,8 @@ def inicializar_banco() -> None:
                 ON backup_documentos(importacao_id);
             CREATE INDEX IF NOT EXISTS idx_manutencoes_ordem
                 ON manutencoes_programadas(ordem, id);
+            CREATE INDEX IF NOT EXISTS idx_manutencoes_github_backups_data
+                ON manutencoes_github_backups(data_hora DESC);
             """
         )
         if conn.execute("SELECT COUNT(*) FROM historico_atualizacoes").fetchone()[0] == 0:
@@ -2474,6 +2821,8 @@ def render_editor_manutencao_programada() -> None:
     with col_salvar:
         if st.button("Salvar painel", type="primary", use_container_width=True):
             total = salvar_manutencoes_programadas(editor)
+            if backup_manutencoes_github_configurado():
+                fazer_backup_manutencoes_github("salvar_painel")
             st.success(f"Painel salvo com {total} registro(s).")
             st.rerun()
     with col_tv:
@@ -2483,12 +2832,25 @@ def render_editor_manutencao_programada() -> None:
             use_container_width=True,
         )
 
+    status_backup = ultimo_status_backup_manutencoes_github()
+    if status_backup:
+        st.caption(
+            "Backup GitHub: "
+            f"{status_backup['status']} em {status_backup['data_hora']} "
+            f"({status_backup['registros']} registro(s)) - {status_backup['mensagem']}"
+        )
+    elif not backup_manutencoes_github_configurado():
+        st.caption(
+            "Backup GitHub automatico aguardando configuracao de GITHUB_TOKEN nos Secrets."
+        )
+
     st.markdown('<div class="faixa">Prévia da TV</div>', unsafe_allow_html=True)
     mostrar_painel_manutencao_programada(compacto=True)
 
 
 def render_painel_manutencao_programada() -> None:
     inicializar_banco()
+    fazer_backup_manutencoes_github_periodico()
     css_tv_documentos_coupa()
     if query_ativo("embed_tv"):
         mostrar_painel_manutencao_programada(compacto=True)

@@ -39,6 +39,7 @@ COR_CABECALHO = "#020D3F"
 COR_TEXTO = "#B5911B"
 CONTROLE_TV_COUPA_URL = "https://controle-integrado.streamlit.app/?tv=documentos-coupa&painel=coupa"
 MANUTENCAO_COLUNAS = ["Placa", "Manutenção Programada", "Previsão Saída"]
+PNEUS_COLUNAS = ["NOME DA RECAPADORA", "SERVIÇO"]
 GITHUB_MANUTENCOES_BACKUP_PATH = "backups/manutencoes_programadas_latest.json"
 GITHUB_MANUTENCOES_BACKUP_HISTORY_DIR = "backups/history"
 GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS = 2
@@ -444,10 +445,63 @@ def salvar_manutencoes_programadas(df: pd.DataFrame) -> int:
     return len(registros)
 
 
+def carregar_pneus_programados() -> pd.DataFrame:
+    with conectar() as conn:
+        linhas = conn.execute(
+            """
+            SELECT nome_recapadora, servico
+            FROM manutencoes_pneus
+            ORDER BY ordem, id
+            """
+        ).fetchall()
+    if not linhas:
+        return pd.DataFrame(columns=PNEUS_COLUNAS)
+    return pd.DataFrame(
+        [
+            {
+                "NOME DA RECAPADORA": row["nome_recapadora"],
+                "SERVIÇO": row["servico"],
+            }
+            for row in linhas
+        ],
+        columns=PNEUS_COLUNAS,
+    )
+
+
+def salvar_pneus_programados(df: pd.DataFrame) -> int:
+    registros = []
+    for _, row in df.iterrows():
+        nome_recapadora = str(row.get("NOME DA RECAPADORA", "") or "").strip()
+        servico = str(row.get("SERVIÇO", "") or "").strip()
+        if not nome_recapadora and not servico:
+            continue
+        registros.append((len(registros) + 1, nome_recapadora, servico))
+
+    atualizado_em = agora_local().isoformat(timespec="seconds")
+    with conectar() as conn:
+        conn.execute("DELETE FROM manutencoes_pneus")
+        conn.executemany(
+            """
+            INSERT INTO manutencoes_pneus
+                (ordem, nome_recapadora, servico, atualizado_em)
+            VALUES (?, ?, ?, ?)
+            """,
+            [(*registro, atualizado_em) for registro in registros],
+        )
+    return len(registros)
+
+
 def ultima_atualizacao_manutencoes() -> str:
     with conectar() as conn:
         row = conn.execute(
-            "SELECT MAX(atualizado_em) AS atualizado_em FROM manutencoes_programadas"
+            """
+            SELECT MAX(atualizado_em) AS atualizado_em
+            FROM (
+                SELECT atualizado_em FROM manutencoes_programadas
+                UNION ALL
+                SELECT atualizado_em FROM manutencoes_pneus
+            )
+            """
         ).fetchone()
     return formatar_data_hora(row["atualizado_em"]) if row and row["atualizado_em"] else "Sem registros salvos"
 
@@ -463,6 +517,15 @@ def preparar_editor_manutencoes(df: pd.DataFrame) -> pd.DataFrame:
         editor["Previsão Saída"], dayfirst=True, errors="coerce"
     ).dt.date
     return editor[MANUTENCAO_COLUNAS]
+
+
+def preparar_editor_pneus(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(
+            [{"NOME DA RECAPADORA": "", "SERVIÇO": ""}],
+            columns=PNEUS_COLUNAS,
+        )
+    return df[PNEUS_COLUNAS].copy()
 
 
 GITHUB_SECRET_ALIASES = {
@@ -660,15 +723,24 @@ def mensagem_erro_github(erro: HTTPError) -> str:
 
 
 def payload_backup_manutencoes() -> dict[str, Any]:
-    dados = carregar_manutencoes_programadas()
-    registros = json.loads(
-        dados.where(pd.notna(dados), None).to_json(orient="records", force_ascii=False)
+    manutencoes = carregar_manutencoes_programadas()
+    pneus = carregar_pneus_programados()
+    registros_manutencoes = json.loads(
+        manutencoes.where(pd.notna(manutencoes), None).to_json(
+            orient="records", force_ascii=False
+        )
+    )
+    registros_pneus = json.loads(
+        pneus.where(pd.notna(pneus), None).to_json(
+            orient="records", force_ascii=False
+        )
     )
     return {
-        "schema": "documentos_rw_manutencoes_programadas_backup_v1",
+        "schema": "documentos_rw_manutencoes_programadas_backup_v2",
         "generated_at": agora_local().isoformat(timespec="seconds"),
-        "records": int(len(registros)),
-        "rows": registros,
+        "records": int(len(registros_manutencoes) + len(registros_pneus)),
+        "manutencoes": registros_manutencoes,
+        "pneus": registros_pneus,
     }
 
 
@@ -945,6 +1017,14 @@ def inicializar_banco() -> None:
                 atualizado_em TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS manutencoes_pneus (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ordem INTEGER NOT NULL,
+                nome_recapadora TEXT NOT NULL,
+                servico TEXT NOT NULL,
+                atualizado_em TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS manutencoes_github_backups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 data_hora TEXT NOT NULL,
@@ -965,6 +1045,8 @@ def inicializar_banco() -> None:
                 ON backup_documentos(importacao_id);
             CREATE INDEX IF NOT EXISTS idx_manutencoes_ordem
                 ON manutencoes_programadas(ordem, id);
+            CREATE INDEX IF NOT EXISTS idx_manutencoes_pneus_ordem
+                ON manutencoes_pneus(ordem, id);
             CREATE INDEX IF NOT EXISTS idx_manutencoes_github_backups_data
                 ON manutencoes_github_backups(data_hora DESC);
             """
@@ -2419,6 +2501,44 @@ def estilizar_tabela_vencimentos_proximos(df: pd.DataFrame):
     )
 
 
+def montar_corpo_tabela_tv(
+    tabela: pd.DataFrame,
+    mensagem_vazia: str,
+    destacar_vencidos: bool = True,
+    classe_wrap: str = "tabela-tv-wrap",
+) -> str:
+    if tabela.empty:
+        return (
+            '<div class="mensagem-vazia">'
+            f"{mensagem_vazia}"
+            "</div>"
+        )
+    cabecalho = "".join(
+        f"<th>{html.escape(str(coluna))}</th>" for coluna in tabela.columns
+    )
+    linhas = []
+    for _, row in tabela.iterrows():
+        prazo = str(row.get("Prazo", ""))
+        classe_linha = (
+            ' class="linha-vencida"'
+            if destacar_vencidos and "vencido" in prazo.lower()
+            else ""
+        )
+        celulas = "".join(
+            f"<td>{html.escape(str(row[coluna]))}</td>"
+            for coluna in tabela.columns
+        )
+        linhas.append(f"<tr{classe_linha}>{celulas}</tr>")
+    return (
+        f'<div class="{html.escape(classe_wrap)}">'
+        '<table class="tabela-tv">'
+        f"<thead><tr>{cabecalho}</tr></thead>"
+        f"<tbody>{''.join(linhas)}</tbody>"
+        "</table>"
+        "</div>"
+    )
+
+
 def montar_html_painel_vencimentos_proximos(
     tabela: pd.DataFrame,
     atualizado_banco: str = "",
@@ -2429,6 +2549,7 @@ def montar_html_painel_vencimentos_proximos(
     painel_id: str = "painel-vencimentos-proximos",
     destacar_vencidos: bool = True,
     rotulo_atualizacao: str = "Atualizacao do banco Documentos",
+    corpo_tabela_customizado: str | None = None,
 ) -> str:
     logo_uri = logo_data_uri()
     logo_html = (
@@ -2437,37 +2558,11 @@ def montar_html_painel_vencimentos_proximos(
     )
     atualizado_banco = atualizado_banco or "Sem atualizacao"
     compacto_class = " painel-tv-compacto" if compacto else ""
-    if tabela.empty:
-        corpo_tabela = (
-            '<div class="mensagem-vazia">'
-            f"{mensagem_vazia}"
-            "</div>"
-        )
-    else:
-        cabecalho = "".join(
-            f"<th>{html.escape(str(coluna))}</th>" for coluna in tabela.columns
-        )
-        linhas = []
-        for _, row in tabela.iterrows():
-            prazo = str(row.get("Prazo", ""))
-            classe_linha = (
-                ' class="linha-vencida"'
-                if destacar_vencidos and "vencido" in prazo.lower()
-                else ""
-            )
-            celulas = "".join(
-                f"<td>{html.escape(str(row[coluna]))}</td>"
-                for coluna in tabela.columns
-            )
-            linhas.append(f"<tr{classe_linha}>{celulas}</tr>")
-        corpo_tabela = (
-            '<div class="tabela-tv-wrap">'
-            '<table class="tabela-tv">'
-            f"<thead><tr>{cabecalho}</tr></thead>"
-            f"<tbody>{''.join(linhas)}</tbody>"
-            "</table>"
-            "</div>"
-        )
+    corpo_tabela = corpo_tabela_customizado or montar_corpo_tabela_tv(
+        tabela,
+        mensagem_vazia,
+        destacar_vencidos=destacar_vencidos,
+    )
 
     return f"""
     <!doctype html>
@@ -2562,6 +2657,37 @@ def montar_html_painel_vencimentos_proximos(
                 border: 1px solid #D8C98D;
                 border-radius: 8px;
                 background: #071526;
+            }}
+            .painel-manutencao-dividido {{
+                flex: 1 1 auto;
+                min-height: 0;
+                width: 100%;
+                display: grid;
+                grid-template-columns: 3fr 1fr;
+                gap: .55rem;
+                margin-top: .35rem;
+            }}
+            .bloco-tv {{
+                min-height: 0;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
+            }}
+            .bloco-tv-titulo {{
+                flex: 0 0 auto;
+                background: var(--cabecalho);
+                border: 1px solid #D8C98D;
+                border-bottom: 0;
+                border-radius: 8px 8px 0 0;
+                color: var(--texto);
+                font-size: 13px;
+                font-weight: 950;
+                text-align: center;
+                padding: 5px 8px;
+            }}
+            .bloco-tv .tabela-tv-wrap {{
+                margin-top: 0;
+                border-radius: 0 0 8px 8px;
             }}
             .tabela-tv {{
                 width: 100%;
@@ -2762,18 +2888,39 @@ def mostrar_painel_vencimentos_proximos(
 
 def mostrar_painel_manutencao_programada(compacto: bool = False) -> None:
     configurar_recarga_diaria()
-    tabela = carregar_manutencoes_programadas()
+    tabela_manutencoes = carregar_manutencoes_programadas()
+    tabela_pneus = carregar_pneus_programados()
+    corpo_dividido = f"""
+        <div class="painel-manutencao-dividido">
+            <section class="bloco-tv bloco-manutencao">
+                <div class="bloco-tv-titulo">MANUTEN&Ccedil;&Otilde;ES</div>
+                {montar_corpo_tabela_tv(
+                    tabela_manutencoes,
+                    "Nenhuma manuten&ccedil;&atilde;o programada cadastrada.",
+                    destacar_vencidos=False,
+                )}
+            </section>
+            <section class="bloco-tv bloco-pneus">
+                <div class="bloco-tv-titulo">PNEUS</div>
+                {montar_corpo_tabela_tv(
+                    tabela_pneus,
+                    "Nenhum servi&ccedil;o de pneus cadastrado.",
+                    destacar_vencidos=False,
+                )}
+            </section>
+        </div>
+    """
     components.html(
         montar_html_painel_vencimentos_proximos(
-            tabela,
+            tabela_manutencoes,
             ultima_atualizacao_manutencoes(),
             compacto=compacto,
             titulo="MANUTEN&Ccedil;&Atilde;O PROGRAMADA",
-            subtitulo="Placas com manuten&ccedil;&atilde;o programada e previs&atilde;o de sa&iacute;da",
-            mensagem_vazia="Nenhuma manuten&ccedil;&atilde;o programada cadastrada.",
+            subtitulo="Manuten&ccedil;&otilde;es programadas e pneus",
             painel_id="painel-manutencao-programada",
             destacar_vencidos=False,
             rotulo_atualizacao="Atualizacao do painel",
+            corpo_tabela_customizado=corpo_dividido,
         ),
         height=1020,
         scrolling=False,
@@ -2801,29 +2948,51 @@ def render_editor_manutencao_programada() -> None:
         unsafe_allow_html=True,
     )
     dados = carregar_manutencoes_programadas()
-    editor = st.data_editor(
-        preparar_editor_manutencoes(dados),
-        column_config={
-            "Placa": st.column_config.TextColumn("Placa", width="medium"),
-            "Manutenção Programada": st.column_config.TextColumn(
-                "Manutenção Programada", width="large"
-            ),
-            "Previsão Saída": st.column_config.DateColumn(
-                "Previsão Saída", format="DD/MM/YYYY", width="medium"
-            ),
-        },
-        hide_index=True,
-        num_rows="dynamic",
-        use_container_width=True,
-        key="editor_manutencao_programada",
-    )
+    dados_pneus = carregar_pneus_programados()
+    col_manutencao, col_pneus = st.columns([0.75, 0.25])
+    with col_manutencao:
+        st.markdown('<div class="faixa">Manutenções</div>', unsafe_allow_html=True)
+        editor = st.data_editor(
+            preparar_editor_manutencoes(dados),
+            column_config={
+                "Placa": st.column_config.TextColumn("Placa", width="medium"),
+                "Manutenção Programada": st.column_config.TextColumn(
+                    "Manutenção Programada", width="large"
+                ),
+                "Previsão Saída": st.column_config.DateColumn(
+                    "Previsão Saída", format="DD/MM/YYYY", width="medium"
+                ),
+            },
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor_manutencao_programada",
+        )
+    with col_pneus:
+        st.markdown('<div class="faixa">Pneus</div>', unsafe_allow_html=True)
+        editor_pneus = st.data_editor(
+            preparar_editor_pneus(dados_pneus),
+            column_config={
+                "NOME DA RECAPADORA": st.column_config.TextColumn(
+                    "NOME DA RECAPADORA", width="medium"
+                ),
+                "SERVIÇO": st.column_config.TextColumn("SERVIÇO", width="medium"),
+            },
+            hide_index=True,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="editor_pneus_programados",
+        )
     col_salvar, col_tv = st.columns([0.35, 0.65])
     with col_salvar:
         if st.button("Salvar painel", type="primary", use_container_width=True):
             total = salvar_manutencoes_programadas(editor)
+            total_pneus = salvar_pneus_programados(editor_pneus)
             if backup_manutencoes_github_configurado():
                 fazer_backup_manutencoes_github("salvar_painel")
-            st.success(f"Painel salvo com {total} registro(s).")
+            st.success(
+                f"Painel salvo com {total} manutenção(ões) e {total_pneus} serviço(s) de pneus."
+            )
             st.rerun()
     with col_tv:
         st.link_button(

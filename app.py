@@ -382,7 +382,12 @@ def configurar_recarga_diaria() -> None:
 
 
 def formatar_data_saida_manutencao(valor) -> str:
-    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+    try:
+        if valor is None or pd.isna(valor):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    if str(valor).strip().lower() in {"", "nat", "nan", "none"}:
         return ""
     if isinstance(valor, pd.Timestamp):
         return valor.strftime("%d/%m/%Y") if not pd.isna(valor) else ""

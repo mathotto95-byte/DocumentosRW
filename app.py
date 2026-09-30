@@ -1,13 +1,15 @@
 import base64
 import html
 import json
+import logging
 import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 import unicodedata
-import uuid
+from contextlib import closing
 from datetime import date, datetime, timedelta
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -40,9 +42,7 @@ COR_TEXTO = "#B5911B"
 CONTROLE_TV_COUPA_URL = "https://controle-integrado.streamlit.app/?tv=documentos-coupa&painel=coupa"
 MANUTENCAO_COLUNAS = ["Placa", "Manutenção Programada", "Previsão Saída"]
 PNEUS_COLUNAS = ["NOME DA RECAPADORA", "SERVIÇO"]
-GITHUB_MANUTENCOES_BACKUP_PATH = "backups/manutencoes_programadas_latest.json"
-GITHUB_MANUTENCOES_BACKUP_HISTORY_DIR = "backups/history"
-GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS = 2
+GITHUB_BACKUP_PATH = "backups/documentosrw_latest.json"
 
 TIPOS_DOCUMENTO = [
     "CIV",
@@ -537,21 +537,11 @@ GITHUB_SECRET_ALIASES = {
     "GITHUB_TOKEN": ["GITHUB_TOKEN", "github_token", "token"],
     "GITHUB_REPOSITORY": ["GITHUB_REPOSITORY", "github_repository", "repository", "repo"],
     "GITHUB_BRANCH": ["GITHUB_BRANCH", "github_branch", "branch"],
-    "GITHUB_MANUTENCOES_BACKUP_PATH": [
-        "GITHUB_MANUTENCOES_BACKUP_PATH",
-        "github_manutencoes_backup_path",
-        "manutencoes_backup_path",
-    ],
     "GITHUB_MANUTENCOES_AUTO_BACKUP": [
         "GITHUB_MANUTENCOES_AUTO_BACKUP",
         "github_manutencoes_auto_backup",
         "manutencoes_auto_backup",
         "GITHUB_AUTO_BACKUP",
-    ],
-    "GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS": [
-        "GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS",
-        "github_manutencoes_backup_interval_hours",
-        "manutencoes_backup_interval_hours",
     ],
 }
 
@@ -599,32 +589,21 @@ def bool_secret(valor: object, padrao: bool = False) -> bool:
 
 
 def configuracoes_backup_manutencoes_github() -> dict[str, Any]:
-    intervalo_texto = ler_secret_github(
-        "GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS",
-        str(GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS),
-    )
-    try:
-        intervalo_horas = max(1, int(float(intervalo_texto)))
-    except (TypeError, ValueError):
-        intervalo_horas = GITHUB_MANUTENCOES_BACKUP_INTERVAL_HOURS
     return {
         "token": normalizar_token_github(ler_secret_github("GITHUB_TOKEN")),
         "repository": ler_secret_github("GITHUB_REPOSITORY", "mathotto95-byte/DocumentosRW"),
         "branch": ler_secret_github("GITHUB_BRANCH", "main"),
-        "latest_path": ler_secret_github(
-            "GITHUB_MANUTENCOES_BACKUP_PATH",
-            GITHUB_MANUTENCOES_BACKUP_PATH,
-        ),
+        "latest_path": GITHUB_BACKUP_PATH,
         "auto_backup": bool_secret(
             ler_secret_github("GITHUB_MANUTENCOES_AUTO_BACKUP", "SIM"),
             True,
         ),
-        "interval_hours": intervalo_horas,
     }
 
 
-def backup_manutencoes_github_configurado() -> bool:
-    config = configuracoes_backup_manutencoes_github()
+def backup_manutencoes_github_configurado(config=None) -> bool:
+    if config is None:
+        config = configuracoes_backup_manutencoes_github()
     return bool(
         config["auto_backup"]
         and config["token"]
@@ -728,24 +707,20 @@ def mensagem_erro_github(erro: HTTPError) -> str:
 
 
 def payload_backup_manutencoes() -> dict[str, Any]:
-    manutencoes = carregar_manutencoes_programadas()
-    pneus = carregar_pneus_programados()
-    registros_manutencoes = json.loads(
-        manutencoes.where(pd.notna(manutencoes), None).to_json(
-            orient="records", force_ascii=False
-        )
-    )
-    registros_pneus = json.loads(
-        pneus.where(pd.notna(pneus), None).to_json(
-            orient="records", force_ascii=False
-        )
-    )
+    # SQLite backup inclui o WAL e mantem todas as tabelas no mesmo instante.
+    with closing(conectar()) as origem, closing(sqlite3.connect(":memory:")) as copia:
+        origem.backup(copia)
+        totais = {
+            tabela: copia.execute(f'SELECT COUNT(*) FROM "{tabela}"').fetchone()[0]
+            for tabela in ("documentos", "manutencoes_programadas", "manutencoes_pneus")
+        }
+        sql = "\n".join(copia.iterdump())
     return {
-        "schema": "documentos_rw_manutencoes_programadas_backup_v2",
+        "schema": "documentos_rw_backup_completo_v1",
         "generated_at": agora_local().isoformat(timespec="seconds"),
-        "records": int(len(registros_manutencoes) + len(registros_pneus)),
-        "manutencoes": registros_manutencoes,
-        "pneus": registros_pneus,
+        "records": sum(totais.values()),
+        "totals": totais,
+        "database_sql": sql,
     }
 
 
@@ -754,7 +729,7 @@ def registrar_backup_manutencoes_github(
     mensagem: str,
     registros: int = 0,
 ) -> None:
-    with conectar() as conn:
+    with closing(conectar()) as conn, conn:
         conn.execute(
             """
             INSERT INTO manutencoes_github_backups
@@ -771,15 +746,16 @@ def registrar_backup_manutencoes_github(
 
 
 def ultimo_backup_manutencoes_github_sucesso() -> datetime | None:
-    with conectar() as conn:
+    with closing(conectar()) as conn:
         row = conn.execute(
             """
             SELECT data_hora
             FROM manutencoes_github_backups
-            WHERE status = 'SUCESSO'
+            WHERE status = 'SUCESSO' AND mensagem = ?
             ORDER BY data_hora DESC
             LIMIT 1
-            """
+            """,
+            (f"Backup enviado para {GITHUB_BACKUP_PATH}.",),
         ).fetchone()
     if not row or not row["data_hora"]:
         return None
@@ -789,43 +765,31 @@ def ultimo_backup_manutencoes_github_sucesso() -> datetime | None:
         return None
 
 
-def backup_manutencoes_github_devido(forcar: bool = False) -> bool:
-    if forcar:
-        return True
-    config = configuracoes_backup_manutencoes_github()
+def backup_manutencoes_github_devido() -> bool:
+    agora = agora_local()
+    horario = agora.replace(hour=22, minute=0, second=0, microsecond=0)
+    if agora < horario:
+        horario -= timedelta(days=1)
     ultimo = ultimo_backup_manutencoes_github_sucesso()
-    if ultimo is None:
-        return True
-    return agora_local() - ultimo >= timedelta(hours=int(config["interval_hours"]))
+    return ultimo is None or ultimo.astimezone(agora.tzinfo) < horario
 
 
-def fazer_backup_manutencoes_github(motivo: str = "periodico") -> dict[str, Any]:
-    config = configuracoes_backup_manutencoes_github()
+def fazer_backup_manutencoes_github(motivo: str = "diario_22h", config=None) -> dict[str, Any]:
+    if config is None:
+        config = configuracoes_backup_manutencoes_github()
     payload = payload_backup_manutencoes()
     registros = int(payload["records"])
     if token_github_placeholder(config["token"]):
         resultado = {"status": "TOKEN_INVALIDO", "message": "GITHUB_TOKEN parece incompleto.", "records": registros}
-    elif not backup_manutencoes_github_configurado():
+    elif not backup_manutencoes_github_configurado(config):
         resultado = {"status": "NAO_CONFIGURADO", "message": "Configure GITHUB_TOKEN nos Secrets.", "records": registros}
     else:
-        stamp = agora_local().strftime("%Y%m%d_%H%M%S")
-        historico = (
-            f"{GITHUB_MANUTENCOES_BACKUP_HISTORY_DIR}/"
-            f"{stamp}_{uuid.uuid4().hex[:8]}_manutencoes_programadas.json"
-        )
         try:
             enviar_json_github(
                 config,
                 config["latest_path"],
                 payload,
-                f"Backup manutencoes programadas latest ({motivo})",
-            )
-            enviar_json_github(
-                config,
-                historico,
-                payload,
-                f"Backup manutencoes programadas historico ({motivo})",
-                tentativas=1,
+                f"Backup completo DocumentosRW e manutencao ({motivo})",
             )
             resultado = {
                 "status": "SUCESSO",
@@ -842,12 +806,30 @@ def fazer_backup_manutencoes_github(motivo: str = "periodico") -> dict[str, Any]
     return resultado
 
 
-def fazer_backup_manutencoes_github_periodico() -> dict[str, Any] | None:
-    if not backup_manutencoes_github_configurado():
+@st.cache_resource
+def iniciar_backup_diario():
+    config = configuracoes_backup_manutencoes_github()
+    if not backup_manutencoes_github_configurado(config):
         return None
-    if not backup_manutencoes_github_devido():
-        return None
-    return fazer_backup_manutencoes_github("periodico_2h")
+
+    def executar():
+        # ponytail: um processo Streamlit; usar agendador externo se houver replicas.
+        while True:
+            espera = 30
+            try:
+                if backup_manutencoes_github_devido():
+                    resultado = fazer_backup_manutencoes_github(config=config)
+                    if resultado["status"] != "SUCESSO":
+                        espera = 300
+                        logging.error("Backup diario: %s", resultado["message"])
+            except Exception:
+                logging.exception("Falha no backup diario DocumentosRW")
+                espera = 300
+            time.sleep(espera)
+
+    trabalhador = threading.Thread(target=executar, name="backup-diario", daemon=True)
+    trabalhador.start()
+    return trabalhador
 
 
 def ultimo_status_backup_manutencoes_github() -> dict[str, Any]:
@@ -2993,8 +2975,6 @@ def render_editor_manutencao_programada() -> None:
         if st.button("Salvar painel", type="primary", use_container_width=True):
             total = salvar_manutencoes_programadas(editor)
             total_pneus = salvar_pneus_programados(editor_pneus)
-            if backup_manutencoes_github_configurado():
-                fazer_backup_manutencoes_github("salvar_painel")
             st.success(
                 f"Painel salvo com {total} manutenção(ões) e {total_pneus} serviço(s) de pneus."
             )
@@ -3024,7 +3004,6 @@ def render_editor_manutencao_programada() -> None:
 
 def render_painel_manutencao_programada() -> None:
     inicializar_banco()
-    fazer_backup_manutencoes_github_periodico()
     css_tv_documentos_coupa()
     if query_ativo("embed_tv"):
         mostrar_painel_manutencao_programada(compacto=True)
@@ -3285,6 +3264,8 @@ st.markdown(
 
 
 def main() -> None:
+    inicializar_banco()
+    iniciar_backup_diario()
     if not query_ativo("admin"):
         render_tv_documentos_coupa()
         return

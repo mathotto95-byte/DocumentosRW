@@ -2101,12 +2101,12 @@ def buscar_vencimentos_proximos(
         return pd.DataFrame(columns=colunas)
 
     dados["data_vencimento"] = pd.to_datetime(dados["vencimento"], errors="coerce")
-    dados = dados[dados["data_vencimento"].notna() | dados["documento"].eq("AETs")]
+    dados = dados[dados["data_vencimento"].notna()]
     if dados.empty:
         return pd.DataFrame(columns=colunas)
 
     dados["dias_restantes"] = (dados["data_vencimento"] - referencia).dt.days
-    dados = dados[dados["dias_restantes"].le(dias_janela) | dados["documento"].eq("AETs")]
+    dados = dados[dados["dias_restantes"].le(dias_janela)]
     if dados.empty:
         return pd.DataFrame(columns=colunas)
 
@@ -2531,8 +2531,8 @@ def montar_html_painel_vencimentos_proximos(
     atualizado_banco: str = "",
     compacto: bool = False,
     titulo: str = "VENCIMENTOS PR&Oacute;XIMOS",
-    subtitulo: str = "Todas as AETs, documentos vencidos e vencimentos nos pr&oacute;ximos 30 dias",
-    mensagem_vazia: str = "Nenhuma AET ou documento vencido ou com vencimento nos pr&oacute;ximos 30 dias.",
+    subtitulo: str = "Documentos vencidos em vermelho e vencimentos nos pr&oacute;ximos 30 dias",
+    mensagem_vazia: str = "Nenhum documento vencido ou com vencimento nos pr&oacute;ximos 30 dias.",
     painel_id: str = "painel-vencimentos-proximos",
     destacar_vencidos: bool = True,
     rotulo_atualizacao: str = "Atualizacao do banco Documentos",

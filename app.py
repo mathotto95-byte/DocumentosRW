@@ -2101,12 +2101,12 @@ def buscar_vencimentos_proximos(
         return pd.DataFrame(columns=colunas)
 
     dados["data_vencimento"] = pd.to_datetime(dados["vencimento"], errors="coerce")
-    dados = dados[dados["data_vencimento"].notna()]
+    dados = dados[dados["data_vencimento"].notna() | dados["documento"].eq("AETs")]
     if dados.empty:
         return pd.DataFrame(columns=colunas)
 
     dados["dias_restantes"] = (dados["data_vencimento"] - referencia).dt.days
-    dados = dados[dados["dias_restantes"].le(dias_janela)]
+    dados = dados[dados["dias_restantes"].le(dias_janela) | dados["documento"].eq("AETs")]
     if dados.empty:
         return pd.DataFrame(columns=colunas)
 
@@ -2115,8 +2115,8 @@ def buscar_vencimentos_proximos(
         dados["placa"],
     )
     dados["tipo_documento"] = dados["documento"]
-    dados["texto_dias_restantes"] = dados["dias_restantes"].astype(int).apply(
-        texto_dias_restantes
+    dados["texto_dias_restantes"] = dados["dias_restantes"].apply(
+        lambda dias: texto_dias_restantes(int(dias)) if pd.notna(dias) else "Sem data"
     )
 
     saida = (
@@ -2153,7 +2153,7 @@ def preparar_vencimentos_proximos_tv(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=colunas)
     saida = df.copy()
-    saida["Vencimento"] = saida["data_vencimento"].dt.strftime("%d/%m/%Y")
+    saida["Vencimento"] = saida["data_vencimento"].dt.strftime("%d/%m/%Y").fillna("Sem data")
     saida = saida.rename(
         columns={
             "tipo_documento": "Tipo do documento",
@@ -2185,8 +2185,8 @@ def exportar_vencimentos_proximos_json(
             {
                 "tipo_documento": item.tipo_documento,
                 "placas_composicao": item.placa_ou_composicao,
-                "data_vencimento": item.data_vencimento.strftime("%d/%m/%Y"),
-                "dias_restantes": int(item.dias_restantes),
+                "data_vencimento": item.data_vencimento.strftime("%d/%m/%Y") if pd.notna(item.data_vencimento) else "Sem data",
+                "dias_restantes": int(item.dias_restantes) if pd.notna(item.dias_restantes) else None,
                 "texto_dias_restantes": item.texto_dias_restantes,
             }
         )
@@ -2531,8 +2531,8 @@ def montar_html_painel_vencimentos_proximos(
     atualizado_banco: str = "",
     compacto: bool = False,
     titulo: str = "VENCIMENTOS PR&Oacute;XIMOS",
-    subtitulo: str = "Documentos vencidos em vermelho e vencimentos nos pr&oacute;ximos 30 dias",
-    mensagem_vazia: str = "Nenhum documento vencido ou com vencimento nos pr&oacute;ximos 30 dias.",
+    subtitulo: str = "Todas as AETs, documentos vencidos e vencimentos nos pr&oacute;ximos 30 dias",
+    mensagem_vazia: str = "Nenhuma AET ou documento vencido ou com vencimento nos pr&oacute;ximos 30 dias.",
     painel_id: str = "painel-vencimentos-proximos",
     destacar_vencidos: bool = True,
     rotulo_atualizacao: str = "Atualizacao do banco Documentos",

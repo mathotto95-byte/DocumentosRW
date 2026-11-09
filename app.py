@@ -2876,6 +2876,15 @@ def mostrar_painel_vencimentos_proximos(
 def mostrar_painel_manutencao_programada(compacto: bool = False) -> None:
     configurar_recarga_diaria()
     tabela_manutencoes = carregar_manutencoes_programadas()
+    tabela_manutencoes = (
+        tabela_manutencoes.assign(
+            _previsao_saida=pd.to_datetime(
+                tabela_manutencoes["Previsão Saída"], dayfirst=True, errors="coerce"
+            )
+        )
+        .sort_values("_previsao_saida", na_position="last", kind="stable")
+        .drop(columns="_previsao_saida")
+    )
     tabela_pneus = carregar_pneus_programados()
     corpo_dividido = f"""
         <div class="painel-manutencao-dividido">
